@@ -83,6 +83,20 @@ def _extract_auction_id(url: str) -> str:
     return url
 
 
+def _bootstrap_storage_state_from_env() -> None:
+    """If BSTOCK_STORAGE_STATE_B64 env var is set, decode it to disk on startup."""
+    b64 = os.getenv("BSTOCK_STORAGE_STATE_B64")
+    if not b64 or STORAGE_STATE_PATH.exists():
+        return
+    import base64
+    try:
+        STORAGE_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        STORAGE_STATE_PATH.write_bytes(base64.b64decode(b64))
+        log.info("Decoded storage state from env var to %s", STORAGE_STATE_PATH)
+    except Exception as exc:
+        log.error("Failed to decode BSTOCK_STORAGE_STATE_B64: %s", exc)
+
+
 def _wait_for_cloudflare(page: Page, timeout_ms: int = 45000) -> None:
     """Wait out the Cloudflare 'Verifying...' challenge page if present."""
     try:
@@ -105,6 +119,12 @@ def login_if_needed(page: Page) -> None:
     if logged_in_signal:
         log.info("Already logged in (listings visible)")
         return
+
+    if os.getenv("BSTOCK_REQUIRE_COOKIES", "true").lower() == "true":
+        raise RuntimeError(
+            "Session expired or no cookies loaded. Run scripts/bootstrap_session.py "
+            "locally and update BSTOCK_STORAGE_STATE_B64 on Railway."
+        )
 
     email = os.environ["BSTOCK_EMAIL"]
     password = os.environ["BSTOCK_PASSWORD"]
@@ -237,6 +257,7 @@ def parse_card(card_html: str, card_text: str, card_links: list[str], card_image
 
 
 def scrape_listings(url: str = LISTINGS_URL, headless: bool = True) -> list[Listing]:
+    _bootstrap_storage_state_from_env()
     results: list[Listing] = []
     with sync_playwright() as pw:
         browser: Browser = pw.chromium.launch(
