@@ -40,6 +40,16 @@ USER_AGENT = (
     "AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/131.0.0.0 Safari/537.36"
 )
+# Webshare rotating residential proxy — bypasses Cloudflare data center blocks
+WEBSHARE_PROXY = None
+_proxy_user = os.getenv("WEBSHARE_PROXY_USER")
+_proxy_pass = os.getenv("WEBSHARE_PROXY_PASS")
+if _proxy_user and _proxy_pass:
+    WEBSHARE_PROXY = {
+        "server": "http://p.webshare.io:6045",
+        "username": _proxy_user,
+        "password": _proxy_pass,
+    }
 
 
 @dataclass
@@ -274,6 +284,9 @@ def scrape_listings(url: str = LISTINGS_URL, headless: bool = True) -> list[List
             "locale": "en-US",
             "timezone_id": "America/New_York",
         }
+        if WEBSHARE_PROXY:
+            context_kwargs["proxy"] = WEBSHARE_PROXY
+            log.info("Using Webshare residential proxy")
         if STORAGE_STATE_PATH.exists():
             context_kwargs["storage_state"] = str(STORAGE_STATE_PATH)
         context = browser.new_context(**context_kwargs)
