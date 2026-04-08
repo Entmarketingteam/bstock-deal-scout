@@ -1,0 +1,80 @@
+{
+  "name": "B-Stock Deal Alert \u00e2\u20ac\u201d Slack + Email",
+  "nodes": [
+    {
+      "parameters": {
+        "path": "bstock-deal-alert",
+        "httpMethod": "POST",
+        "responseMode": "onReceived",
+        "options": {}
+      },
+      "id": "webhook",
+      "name": "Deal Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        240,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "channel": "#deals",
+        "text": "=:moneybag: *{{$json.tier === 'high_priority' ? 'HIGH PRIORITY ' : ''}}B-Stock Deal*\n*{{$json.summary.title}}*\nMSRP: ${{$json.summary.msrp}} \u00e2\u2020\u2019 Bid: ${{$json.summary.current_bid}} ({{$json.summary.pct_of_msrp}}%)\nPer unit: ${{$json.summary.per_unit}} | Ends: {{$json.summary.time_remaining}}\n{{$json.summary.location}}\n<{{$json.summary.url}}|View listing>",
+        "otherOptions": {}
+      },
+      "id": "slack",
+      "name": "Post to Slack",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.2,
+      "position": [
+        480,
+        240
+      ],
+      "credentials": {
+        "slackApi": {
+          "id": "REPLACE",
+          "name": "ENT Agency Slack"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "fromEmail": "deals@nickient.com",
+        "toEmail": "marketingteam@nickient.com",
+        "subject": "=[B-Stock] {{$json.tier === 'high_priority' ? '\u00f0\u0178\u0161\u00a8 HIGH PRIORITY ' : ''}}{{$json.summary.title}}",
+        "emailFormat": "html",
+        "html": "=<h2>{{$json.summary.title}}</h2><p><strong>MSRP:</strong> ${{$json.summary.msrp}}<br><strong>Current Bid:</strong> ${{$json.summary.current_bid}} ({{$json.summary.pct_of_msrp}}% of MSRP)<br><strong>Per Unit:</strong> ${{$json.summary.per_unit}}<br><strong>Location:</strong> {{$json.summary.location}}<br><strong>Time left:</strong> {{$json.summary.time_remaining}}</p><p><a href=\"{{$json.summary.url}}\">View listing on B-Stock</a></p><img src=\"{{$json.summary.image_url}}\" style=\"max-width:400px\">"
+      },
+      "id": "email",
+      "name": "Send Email",
+      "type": "n8n-nodes-base.emailSend",
+      "typeVersion": 2.1,
+      "position": [
+        480,
+        380
+      ]
+    }
+  ],
+  "connections": {
+    "Deal Webhook": {
+      "main": [
+        [
+          {
+            "node": "Post to Slack",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Send Email",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  }
+}
