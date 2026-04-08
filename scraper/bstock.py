@@ -24,11 +24,22 @@ from typing import Any
 
 from playwright.sync_api import Browser, Page, sync_playwright
 
+try:
+    from playwright_stealth import stealth_sync
+    HAS_STEALTH = True
+except ImportError:
+    HAS_STEALTH = False
+
 log = logging.getLogger(__name__)
 
 STORAGE_STATE_PATH = Path(os.getenv("BSTOCK_STORAGE_STATE", "/tmp/bstock_storage.json"))
-LOGIN_URL = "https://bstock.com/login"
+LOGIN_URL = "https://bstock.com/acct/signin"
 LISTINGS_URL = 'https://bstock.com/all-auctions?condition=%5B%22New%22%5D'
+USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/131.0.0.0 Safari/537.36"
+)
 
 
 @dataclass
@@ -72,19 +83,65 @@ def _extract_auction_id(url: str) -> str:
     return url
 
 
+def _wait_for_cloudflare(page: Page, timeout_ms: int = 45000) -> None:
+    """Wait out the Cloudflare 'Verifying...' challenge page if present."""
+    try:
+        # CF challenge page title
+        page.wait_for_function(
+            """() => !document.title.toLowerCase().includes('just a moment')
+                   && !document.body.innerText.toLowerCase().includes('verifying')""",
+            timeout=timeout_ms,
+        )
+    except Exception as exc:
+        log.warning("Cloudflare wait timed out: %s", exc)
+
+
 def login_if_needed(page: Page) -> None:
     page.goto(LISTINGS_URL, wait_until="domcontentloaded")
-    # Heuristic: if login form appears, fill it
-    if page.url.startswith("https://bstock.com/login") or page.locator("input[type='email'], input[name='email']").count() > 0:
-        email = os.environ["BSTOCK_EMAIL"]
-        password = os.environ["BSTOCK_PASSWORD"]
-        log.info("Logging in to B-Stock as %s", email)
-        page.goto(LOGIN_URL, wait_until="domcontentloaded")
-        page.fill("input[type='email'], input[name='email']", email)
-        page.fill("input[type='password'], input[name='password']", password)
-        page.click("button[type='submit'], button:has-text('Sign In'), button:has-text('Log In')")
-        page.wait_for_load_state("networkidle", timeout=30000)
-        page.goto(LISTINGS_URL, wait_until="domcontentloaded")
+    _wait_for_cloudflare(page)
+
+    # Already logged in if we can see auction cards / no email form
+    logged_in_signal = page.locator("a[href*='/buy/listings/details/']").count() > 0
+    if logged_in_signal:
+        log.info("Already logged in (listings visible)")
+        return
+
+    email = os.environ["BSTOCK_EMAIL"]
+    password = os.environ["BSTOCK_PASSWORD"]
+    log.info("Logging in to B-Stock as %s", email)
+
+    page.goto(LOGIN_URL, wait_until="domcontentloaded")
+    _wait_for_cloudflare(page)
+
+    # Step 1: email page. Type slowly to look human.
+    email_input = page.locator("input[type='email'], input[name='email'], input[placeholder*='mail' i]").first
+    email_input.wait_for(state="visible", timeout=30000)
+    email_input.click()
+    page.wait_for_timeout(300)
+    email_input.type(email, delay=80)
+    page.wait_for_timeout(500)
+
+    # Click "Let's go" button
+    page.locator(
+        "button:has-text(\"Let's go\"), button:has-text('Lets go'), button:has-text('Continue'), button[type='submit']"
+    ).first.click()
+
+    # Step 2: password page
+    password_input = page.locator("input[type='password'], input[name='password']").first
+    password_input.wait_for(state="visible", timeout=30000)
+    _wait_for_cloudflare(page)
+    password_input.click()
+    page.wait_for_timeout(300)
+    password_input.type(password, delay=80)
+    page.wait_for_timeout(500)
+
+    page.locator(
+        "button:has-text('Sign in'), button:has-text('Log in'), button:has-text(\"Let's go\"), button[type='submit']"
+    ).first.click()
+
+    page.wait_for_load_state("networkidle", timeout=45000)
+    page.goto(LISTINGS_URL, wait_until="domcontentloaded")
+    _wait_for_cloudflare(page)
 
 
 def scroll_to_load_all(page: Page, max_scrolls: int = 30) -> None:
@@ -182,12 +239,29 @@ def parse_card(card_html: str, card_text: str, card_links: list[str], card_image
 def scrape_listings(url: str = LISTINGS_URL, headless: bool = True) -> list[Listing]:
     results: list[Listing] = []
     with sync_playwright() as pw:
-        browser: Browser = pw.chromium.launch(headless=headless)
-        context_kwargs: dict[str, Any] = {"viewport": {"width": 1440, "height": 900}}
+        browser: Browser = pw.chromium.launch(
+            headless=headless,
+            args=[
+                "--disable-blink-features=AutomationControlled",
+                "--disable-features=IsolateOrigins,site-per-process",
+                "--no-sandbox",
+            ],
+        )
+        context_kwargs: dict[str, Any] = {
+            "viewport": {"width": 1440, "height": 900},
+            "user_agent": USER_AGENT,
+            "locale": "en-US",
+            "timezone_id": "America/New_York",
+        }
         if STORAGE_STATE_PATH.exists():
             context_kwargs["storage_state"] = str(STORAGE_STATE_PATH)
         context = browser.new_context(**context_kwargs)
         page = context.new_page()
+        if HAS_STEALTH:
+            try:
+                stealth_sync(page)
+            except Exception as exc:
+                log.warning("stealth_sync failed: %s", exc)
 
         login_if_needed(page)
         page.goto(url, wait_until="domcontentloaded")
