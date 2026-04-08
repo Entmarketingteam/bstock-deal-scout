@@ -1,0 +1,15 @@
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+.env
+.env.local
+*.log
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+storage_state.json
+playwright-report/
+test-results/
+.DS_Store
