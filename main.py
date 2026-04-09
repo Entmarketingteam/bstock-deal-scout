@@ -125,12 +125,52 @@ def run(x_trigger_secret: str | None = Header(default=None)) -> dict[str, Any]:
     # 3. Upsert + identify new
     new_ids = upsert_listings(listings) if listings else set()
 
+    # 4. Proactively fetch manifests for reno-relevant new listings (don't wait for alert)
+    enrich_on = os.getenv("ENRICH_MANIFESTS", "true").lower() == "true"
+    if enrich_on:
+        from storage.db import _client as _db_client
+        with _db_client() as c:
+            r = c.get(
+                "/bstock_listings",
+                params={
+                    "reno_relevant": "eq.true",
+                    "has_manifest": "eq.false",
+                    "select": "auction_id,url,title,storefront,current_bid,shipping_estimate,msrp",
+                },
+            )
+            reno_no_manifest = r.json() if r.status_code == 200 else []
+
+        for reno_listing in reno_no_manifest:
+            aid = reno_listing["auction_id"]
+            # Fetch full detail to get manifest URL
+            detail = fetch_listing(aid)
+            if detail and detail.get("manifest_doc_url"):
+                raw_items = fetch_and_parse(detail["manifest_doc_url"])
+                if raw_items:
+                    enriched = enrich_manifest(raw_items)
+                    enriched, fb_total = enrich_manifest_with_resale(enriched)
+                    insert_manifest_items(aid, enriched)
+                    bid = float(reno_listing.get("current_bid") or 0)
+                    ship = float(reno_listing.get("shipping_estimate") or 300)
+                    roi = round((fb_total - bid - ship) / (bid + ship), 4) if (bid + ship) > 0 and fb_total > 0 else None
+                    # Update listing with manifest data + ROI
+                    with _db_client() as c:
+                        c.patch(
+                            f"/bstock_listings?auction_id=eq.{aid}",
+                            json={
+                                "has_manifest": True,
+                                "manifest_doc_url": detail["manifest_doc_url"],
+                                "fb_total_value": fb_total,
+                                "roi_score": roi,
+                            },
+                        )
+                    log.info("Reno manifest fetched for %s: fb_total=%s roi=%s", aid, fb_total, roi)
+
     # 5. Find qualifying unalerted
     qualifying = get_unalerted_qualifying()
     log.info("%d listings qualify for alert", len(qualifying))
 
     alerts_sent = 0
-    enrich_on = os.getenv("ENRICH_MANIFESTS", "true").lower() == "true"
 
     for listing in qualifying:
         manifest_items: list[dict[str, Any]] = []
@@ -138,8 +178,7 @@ def run(x_trigger_secret: str | None = Header(default=None)) -> dict[str, Any]:
             raw_items = fetch_and_parse(listing["manifest_doc_url"])
             if raw_items:
                 manifest_items = enrich_manifest(raw_items)
-                # Resale lookup for reno-relevant listings
-                if listing.get("reno_relevant") or is_reno_relevant(listing):
+                if is_reno_relevant(listing):
                     manifest_items, fb_total = enrich_manifest_with_resale(manifest_items)
                     listing["fb_total_value"] = fb_total
                     bid = float(listing.get("current_bid") or 0)
