@@ -1,4 +1,4 @@
-FROM mcr.microsoft.com/playwright/python:v1.48.0-jammy
+FROM python:3.12-slim
 
 WORKDIR /app
 
@@ -7,8 +7,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
-ENV PYTHONUNBUFFERED=1 \
-    BSTOCK_STORAGE_STATE=/tmp/bstock_storage.json
+ENV PYTHONUNBUFFERED=1
 
 EXPOSE 8080
 
