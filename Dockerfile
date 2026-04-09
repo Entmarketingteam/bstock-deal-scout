@@ -12,3 +12,4 @@ ENV PYTHONUNBUFFERED=1
 EXPOSE 8080
 
 CMD ["sh", "-c", "python -m uvicorn main:app --host 0.0.0.0 --port ${PORT:-8080}"]
+# rebuilt Wed, Apr  8, 2026 10:03:02 PM
