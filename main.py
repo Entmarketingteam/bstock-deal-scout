@@ -12,10 +12,16 @@ from enrichment.tavily_lookup import enrich_manifest
 from scoring import qualifies_for_alert, tier
 from scraper.bstock import scrape_listings
 from scraper.manifest import fetch_and_parse
+from scraper.fetch_listing import fetch_listing
 from storage.db import (
+    add_to_watchlist,
+    get_bid_history,
     get_unalerted_qualifying,
+    get_watchlist,
     insert_manifest_items,
     mark_alerted,
+    record_bid_snapshot,
+    remove_from_watchlist,
     upsert_listings,
 )
 
@@ -34,6 +40,32 @@ def _require_auth(x_trigger_secret: str | None) -> None:
 @app.get("/health")
 def health() -> dict[str, str]:
     return {"status": "ok"}
+
+
+@app.post("/watch/{auction_id}")
+def watch(auction_id: str, reason: str = "", x_trigger_secret: str | None = Header(default=None)) -> dict[str, Any]:
+    _require_auth(x_trigger_secret)
+    add_to_watchlist(auction_id, reason)
+    # Immediately snap current state
+    data = fetch_listing(auction_id)
+    if data:
+        upsert_listings([{**data, "auction_id": auction_id}])
+        record_bid_snapshot(auction_id, data)
+    return {"watching": auction_id, "current": data}
+
+
+@app.delete("/watch/{auction_id}")
+def unwatch(auction_id: str, x_trigger_secret: str | None = Header(default=None)) -> dict[str, Any]:
+    _require_auth(x_trigger_secret)
+    remove_from_watchlist(auction_id)
+    return {"unwatched": auction_id}
+
+
+@app.get("/history/{auction_id}")
+def history(auction_id: str, x_trigger_secret: str | None = Header(default=None)) -> dict[str, Any]:
+    _require_auth(x_trigger_secret)
+    snapshots = get_bid_history(auction_id)
+    return {"auction_id": auction_id, "snapshots": snapshots, "count": len(snapshots)}
 
 
 @app.post("/run")
@@ -69,10 +101,25 @@ def run(x_trigger_secret: str | None = Header(default=None)) -> dict[str, Any]:
             mark_alerted(listing["auction_id"], t, {"listing": listing, "items": len(manifest_items)}, result)
             alerts_sent += 1
 
-    log.info("=== Run complete: %d scraped, %d new, %d alerted ===", len(listings), len(new_ids), alerts_sent)
+    # 5. Poll watchlist — snapshot bid history for watched listings
+    watchlist = get_watchlist()
+    snapped = 0
+    for wid in watchlist:
+        data = fetch_listing(wid)
+        if data:
+            # Upsert into listings so current state is always fresh
+            upsert_listings([{**data, "auction_id": wid}])
+            record_bid_snapshot(wid, data)
+            snapped += 1
+        else:
+            log.warning("Watchlist fetch failed for %s", wid)
+
+    log.info("=== Run complete: %d scraped, %d new, %d alerted, %d watchlist snapped ===",
+             len(listings), len(new_ids), alerts_sent, snapped)
     return {
         "scraped": len(listings),
         "new": len(new_ids),
         "qualifying": len(qualifying),
         "alerts_sent": alerts_sent,
+        "watchlist_snapped": snapped,
     }

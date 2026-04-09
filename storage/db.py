@@ -144,6 +144,63 @@ def mark_alerted(auction_id: str, tier: str, payload: dict[str, Any], response: 
         )
 
 
+def record_bid_snapshot(auction_id: str, listing: dict[str, Any]) -> None:
+    """Insert a bid history snapshot for a watched listing."""
+    from datetime import datetime, timezone
+    with _client() as c:
+        c.post(
+            "/bstock_bid_history",
+            json={
+                "auction_id": auction_id,
+                "snapped_at": datetime.now(timezone.utc).isoformat(),
+                "current_bid": listing.get("current_bid"),
+                "bid_count": listing.get("bid_count"),
+                "pct_of_msrp": listing.get("pct_of_msrp"),
+                "time_remaining": listing.get("time_remaining"),
+                "price_label": listing.get("price_label"),
+            },
+        )
+
+
+def get_watchlist() -> list[str]:
+    """Return active auction_ids on the watchlist."""
+    with _client() as c:
+        r = c.get("/bstock_watchlist", params={"active": "eq.true", "select": "auction_id"})
+        r.raise_for_status()
+        return [row["auction_id"] for row in r.json()]
+
+
+def add_to_watchlist(auction_id: str, reason: str = "") -> None:
+    with _client() as c:
+        r = c.post(
+            "/bstock_watchlist",
+            params={"on_conflict": "auction_id"},
+            headers={"Prefer": "resolution=merge-duplicates,return=minimal"},
+            json={"auction_id": auction_id, "reason": reason, "active": True},
+        )
+        if r.status_code >= 400:
+            r.raise_for_status()
+
+
+def remove_from_watchlist(auction_id: str) -> None:
+    with _client() as c:
+        c.patch(f"/bstock_watchlist?auction_id=eq.{auction_id}", json={"active": False})
+
+
+def get_bid_history(auction_id: str) -> list[dict[str, Any]]:
+    with _client() as c:
+        r = c.get(
+            "/bstock_bid_history",
+            params={
+                "auction_id": f"eq.{auction_id}",
+                "order": "snapped_at.asc",
+                "select": "snapped_at,current_bid,bid_count,pct_of_msrp,time_remaining,price_label",
+            },
+        )
+        r.raise_for_status()
+        return r.json()
+
+
 def get_unalerted_qualifying(min_msrp: float = 2000) -> list[dict[str, Any]]:
     with _client() as c:
         r = c.get(
