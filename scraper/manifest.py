@@ -1,20 +1,18 @@
 """Download and parse B-Stock manifest CSV files.
 
 Manifests are served at docserv.bstock.com/v1/documents/{id} behind auth.
-We reuse the Playwright storage_state cookies via httpx.
+We authenticate via FusionAuth JWT (same as the scraper).
 """
 from __future__ import annotations
 
 import io
-import json
 import logging
-from pathlib import Path
 from typing import Any
 
 import httpx
 import pandas as pd
 
-from .bstock import STORAGE_STATE_PATH
+from .bstock import get_jwt_token, BROWSER_UA
 
 log = logging.getLogger(__name__)
 
@@ -39,26 +37,24 @@ COLUMN_MAP = {
 }
 
 
-def _cookies_from_storage_state() -> dict[str, str]:
-    if not STORAGE_STATE_PATH.exists():
-        return {}
-    state = json.loads(STORAGE_STATE_PATH.read_text())
-    return {
-        c["name"]: c["value"]
-        for c in state.get("cookies", [])
-        if "bstock.com" in c.get("domain", "")
-    }
-
-
 def download_manifest_csv(doc_url: str) -> bytes | None:
-    """Fetch a manifest CSV using the persisted Playwright session cookies."""
-    cookies = _cookies_from_storage_state()
-    if not cookies:
-        log.warning("No cookies found — run the scraper first to establish a session")
+    """Fetch a manifest CSV using FusionAuth JWT."""
+    try:
+        token = get_jwt_token()
+    except Exception as exc:
+        log.warning("Could not get JWT for manifest download: %s", exc)
         return None
     try:
-        with httpx.Client(cookies=cookies, follow_redirects=True, timeout=30) as client:
-            r = client.get(doc_url, headers={"User-Agent": "Mozilla/5.0"})
+        with httpx.Client(
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Cookie": f"token={token}; access_token={token}",
+                "User-Agent": BROWSER_UA,
+            },
+            follow_redirects=True,
+            timeout=30,
+        ) as client:
+            r = client.get(doc_url)
             r.raise_for_status()
             return r.content
     except Exception as exc:
