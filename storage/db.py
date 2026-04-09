@@ -65,6 +65,11 @@ def upsert_listings(listings: list[dict[str, Any]]) -> set[str]:
                 "bid_count": l.get("bid_count"),
                 "price_label": l.get("price_label"),
                 "storefront": l.get("storefront"),
+                "has_manifest": bool(l.get("manifest_doc_url")),
+                "shipping_estimate": l.get("shipping_estimate"),
+                "reno_relevant": l.get("reno_relevant", False),
+                "fb_total_value": l.get("fb_total_value"),
+                "roi_score": l.get("roi_score"),
                 "raw_json": l,
             })
 
@@ -118,6 +123,9 @@ def insert_manifest_items(auction_id: str, items: list[dict[str, Any]]) -> None:
                 "real_source_domain": it.get("real_source_domain"),
                 "real_source_url": it.get("real_source_url"),
                 "enriched_at": now if it.get("real_price") else None,
+                "fb_price": it.get("fb_price"),
+                "fb_source": it.get("fb_source"),
+                "fb_searched_at": it.get("fb_searched_at"),
             })
         r = c.post("/bstock_manifest_items", json=rows)
         if r.status_code >= 400:

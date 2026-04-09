@@ -4,6 +4,17 @@ from __future__ import annotations
 from typing import Any
 
 MIN_MSRP = 2000
+
+# Home renovation keywords — items likely to flip fast on Facebook Marketplace
+RENO_KEYWORDS = [
+    "bathtub", "tub", "faucet", "faucets", "shower", "toilet", "vanity",
+    "sink", "plumbing", "water heater", "tankless", "valve", "trim",
+    "tile", "flooring", "floor", "cabinet", "cabinets", "door", "hardware",
+    "lighting", "light fixture", "chandelier", "ceiling fan",
+    "paint", "stain", "caulk", "grout", "adhesive",
+    "kohler", "moen", "delta", "american standard", "grohe", "hansgrohe",
+    "onewest", "one west", "winston", "weston", "ferguson", "signature hardware",
+]
 HIGH_PRIORITY_PCT = 5.0
 HIGH_PRIORITY_MSRP = 10_000
 
@@ -39,6 +50,19 @@ def qualifies_for_alert(listing: dict[str, Any]) -> bool:
 
     # Everything else: Great Price only, $2k+ MSRP
     return price_label == "Great Price" and msrp >= MIN_MSRP
+
+
+def is_reno_relevant(listing: dict[str, Any]) -> bool:
+    haystack = " ".join([
+        listing.get("title") or "",
+        listing.get("storefront") or "",
+        listing.get("condition") or "",
+    ]).lower()
+    return any(kw in haystack for kw in RENO_KEYWORDS)
+
+
+def has_manifest(listing: dict[str, Any]) -> bool:
+    return bool(listing.get("manifest_doc_url"))
 
 
 def tier(listing: dict[str, Any]) -> str:

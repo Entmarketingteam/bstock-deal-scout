@@ -8,8 +8,10 @@ from typing import Any
 from fastapi import FastAPI, Header, HTTPException
 
 from alerts.dispatch import send_alert
+from enrichment.resale_lookup import enrich_manifest_with_resale
+from enrichment.shipping import estimate_shipping, landed_cost
 from enrichment.tavily_lookup import enrich_manifest
-from scoring import qualifies_for_alert, tier
+from scoring import has_manifest, is_reno_relevant, qualifies_for_alert, tier
 from scraper.bstock import scrape_listings
 from scraper.manifest import fetch_and_parse
 from scraper.fetch_listing import fetch_listing
@@ -61,6 +63,44 @@ def unwatch(auction_id: str, x_trigger_secret: str | None = Header(default=None)
     return {"unwatched": auction_id}
 
 
+@app.get("/reno")
+def reno_deals(x_trigger_secret: str | None = Header(default=None)) -> dict[str, Any]:
+    """All reno-relevant listings with landed cost + ROI breakdown."""
+    _require_auth(x_trigger_secret)
+    from storage.db import _client
+    with _client() as c:
+        r = c.get(
+            "/bstock_listings",
+            params={
+                "reno_relevant": "eq.true",
+                "order": "roi_score.desc.nullslast",
+                "select": "auction_id,title,storefront,location,msrp,current_bid,pct_of_msrp,price_label,time_remaining,has_manifest,shipping_estimate,fb_total_value,roi_score,unit_count,url",
+            },
+        )
+        r.raise_for_status()
+        rows = r.json()
+
+    deals = []
+    for row in rows:
+        lc = landed_cost(row)
+        deals.append({**row, **lc})
+
+    return {"count": len(deals), "deals": deals}
+
+
+@app.get("/landed-cost/{auction_id}")
+def get_landed_cost(auction_id: str, x_trigger_secret: str | None = Header(default=None)) -> dict[str, Any]:
+    _require_auth(x_trigger_secret)
+    from storage.db import _client
+    with _client() as c:
+        r = c.get(f"/bstock_listings?auction_id=eq.{auction_id}&select=*")
+        r.raise_for_status()
+        rows = r.json()
+    if not rows:
+        raise HTTPException(status_code=404, detail="listing not found")
+    return landed_cost(rows[0])
+
+
 @app.get("/history/{auction_id}")
 def history(auction_id: str, x_trigger_secret: str | None = Header(default=None)) -> dict[str, Any]:
     _require_auth(x_trigger_secret)
@@ -77,10 +117,15 @@ def run(x_trigger_secret: str | None = Header(default=None)) -> dict[str, Any]:
     listings = [l.to_dict() for l in scrape_listings()]
     log.info("Scraped %d listings", len(listings))
 
-    # 2. Upsert + identify new
+    # 2. Annotate listings with shipping estimate + reno relevance
+    for l in listings:
+        l["shipping_estimate"] = estimate_shipping(l)
+        l["reno_relevant"] = is_reno_relevant(l)
+
+    # 3. Upsert + identify new
     new_ids = upsert_listings(listings) if listings else set()
 
-    # 3. Find qualifying unalerted
+    # 5. Find qualifying unalerted
     qualifying = get_unalerted_qualifying()
     log.info("%d listings qualify for alert", len(qualifying))
 
@@ -93,6 +138,14 @@ def run(x_trigger_secret: str | None = Header(default=None)) -> dict[str, Any]:
             raw_items = fetch_and_parse(listing["manifest_doc_url"])
             if raw_items:
                 manifest_items = enrich_manifest(raw_items)
+                # Resale lookup for reno-relevant listings
+                if listing.get("reno_relevant") or is_reno_relevant(listing):
+                    manifest_items, fb_total = enrich_manifest_with_resale(manifest_items)
+                    listing["fb_total_value"] = fb_total
+                    bid = float(listing.get("current_bid") or 0)
+                    ship = float(listing.get("shipping_estimate") or 0)
+                    if (bid + ship) > 0 and fb_total > 0:
+                        listing["roi_score"] = round((fb_total - bid - ship) / (bid + ship), 4)
                 insert_manifest_items(listing["auction_id"], manifest_items)
 
         t = tier(listing)
