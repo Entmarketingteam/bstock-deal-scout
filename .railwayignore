@@ -1,0 +1,9 @@
+bstock_storage.json
+bstock_storage_b64.txt
+*.log
+__pycache__/
+.venv/
+venv/
+.env
+scripts/bootstrap_session.py
+scripts/extract_chrome_cookies.py
