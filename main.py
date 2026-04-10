@@ -35,6 +35,47 @@ log = logging.getLogger("bstock-deal-scout")
 app = FastAPI(title="bstock-deal-scout", version="0.1.0")
 
 
+def _synthetic_items(listing: dict) -> list[dict]:
+    """
+    Create synthetic manifest items from listing title + MSRP + unit count
+    when no CSV manifest exists (e.g. Kohler branded pallets).
+
+    Parses titles like:
+      "1 Pallet of Kitchen Faucets by Kohler, 12 Units, New Condition, $X MSRP"
+      "3 Pallets of Bluetooth Shower Heads by Kohler, 165 Units"
+    """
+    import re as _re
+    title = listing.get("title") or ""
+    msrp = float(listing.get("msrp") or 0)
+    unit_count = int(listing.get("unit_count") or 0)
+
+    # Extract brand from "by <Brand>"
+    brand_m = _re.search(r'\bby\s+([A-Za-z][A-Za-z &]+?)(?:\s*,|\s*$)', title, _re.IGNORECASE)
+    brand = brand_m.group(1).strip() if brand_m else ""
+
+    # Extract item description from "Pallet(s) of <Description>"
+    desc_m = _re.search(r'pallets?\s+of\s+(.+?)(?:\s+by\s|\s*,)', title, _re.IGNORECASE)
+    description = desc_m.group(1).strip() if desc_m else title[:60]
+
+    # Determine condition
+    condition = "New" if "new" in title.lower() else "Unknown"
+
+    if not (brand or description) or unit_count == 0 or msrp == 0:
+        return []
+
+    unit_retail = round(msrp / unit_count, 2) if unit_count > 0 else 0
+
+    return [{
+        "brand": brand,
+        "description": description,
+        "qty": unit_count,
+        "unit_retail": unit_retail,
+        "ext_retail": msrp,
+        "condition": condition,
+        "lot_id": listing.get("auction_id"),
+    }]
+
+
 def _require_auth(x_trigger_secret: str | None) -> None:
     expected = os.getenv("TRIGGER_SECRET")
     if expected and x_trigger_secret != expected:
@@ -191,40 +232,48 @@ def run(x_trigger_secret: str | None = Header(default=None)) -> dict[str, Any]:
         for reno_listing in reno_no_manifest:
             aid = reno_listing["auction_id"]
             detail = fetch_listing(aid)
+
+            raw_items = []
             if detail and detail.get("manifest_doc_url"):
                 raw_items = fetch_and_parse(detail["manifest_doc_url"])
-                if raw_items:
-                    # Full quality pipeline: tavily enrichment → quality assessment → bid advice
-                    enriched = enrich_manifest(raw_items)
-                    assessed = assess_items(enriched)
-                    ship = float(reno_listing.get("shipping_estimate") or 300)
-                    advice = advise(reno_listing, assessed, shipping=ship)
 
-                    insert_manifest_items(aid, assessed)
+            # Fallback: synthesize manifest items from listing title + unit count
+            # Used when no CSV manifest exists (e.g. Kohler brand lots)
+            if not raw_items:
+                raw_items = _synthetic_items(reno_listing)
 
-                    bid = float(reno_listing.get("current_bid") or 0)
-                    roi = round((advice["total_fb_value"] - bid - ship) / (bid + ship), 4) \
-                          if (bid + ship) > 0 and advice["total_fb_value"] > 0 else None
+            if raw_items:
+                enriched = enrich_manifest(raw_items)
+                assessed = assess_items(enriched)
+                ship = float(reno_listing.get("shipping_estimate") or 300)
+                advice = advise(reno_listing, assessed, shipping=ship)
 
-                    with _db_client() as c:
-                        c.patch(
-                            f"/bstock_listings?auction_id=eq.{aid}",
-                            json={
-                                "has_manifest": True,
-                                "manifest_doc_url": detail["manifest_doc_url"],
-                                "fb_total_value": advice["total_fb_value"],
-                                "roi_score": roi,
-                                "lot_quality_score": advice["lot_quality_score"],
-                                "recommended_max_bid": advice["recommended_max_bid"],
-                                "walk_away_price": advice["walk_away_price"],
-                                "top_items": advice["top_items"],
-                            },
-                        )
-                    log.info(
-                        "Reno assessed %s: quality=%.1f fb_total=$%,.0f rec_bid=$%,.0f verdict=%s",
-                        aid, advice["lot_quality_score"], advice["total_fb_value"],
-                        advice["recommended_max_bid"], advice["verdict"],
+                insert_manifest_items(aid, assessed)
+
+                bid = float(reno_listing.get("current_bid") or 0)
+                roi = round((advice["total_fb_value"] - bid - ship) / (bid + ship), 4) \
+                      if (bid + ship) > 0 and advice["total_fb_value"] > 0 else None
+
+                manifest_url = (detail or {}).get("manifest_doc_url")
+                with _db_client() as c:
+                    c.patch(
+                        f"/bstock_listings?auction_id=eq.{aid}",
+                        json={
+                            "has_manifest": bool(manifest_url),
+                            **({"manifest_doc_url": manifest_url} if manifest_url else {}),
+                            "fb_total_value": advice["total_fb_value"],
+                            "roi_score": roi,
+                            "lot_quality_score": advice["lot_quality_score"],
+                            "recommended_max_bid": advice["recommended_max_bid"],
+                            "walk_away_price": advice["walk_away_price"],
+                            "top_items": advice["top_items"],
+                        },
                     )
+                log.info(
+                    "Reno assessed %s: quality=%.1f fb_total=$%,.0f rec_bid=$%,.0f verdict=%s",
+                    aid, advice["lot_quality_score"], advice["total_fb_value"],
+                    advice["recommended_max_bid"], advice["verdict"],
+                )
 
     # 5. Find qualifying unalerted
     qualifying = get_unalerted_qualifying()
