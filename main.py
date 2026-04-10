@@ -478,12 +478,12 @@ def generate_mockups(  # noqa: C901
 
 
 @app.get("/lookbook-report", response_class=HTMLResponse)
-def lookbook_report(x_trigger_secret: str | None = Header(default=None)) -> HTMLResponse:  # noqa: C901
+def lookbook_report() -> HTMLResponse:  # noqa: C901
     """
     Visual contractor lookbook — real product images, finish info, per-bathroom cost.
     Targeted at STR developers / builders. Returns self-contained HTML.
+    Intentionally public — designed to be shared with buyers/contractors.
     """
-    _require_auth(x_trigger_secret)
     from storage.db import _client
 
     SKIP_KEYWORDS = ("outdoor", "garden", "power equipment")
