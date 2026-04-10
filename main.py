@@ -568,16 +568,62 @@ def run(x_trigger_secret: str | None = Header(default=None)) -> dict[str, Any]:
             mark_alerted(listing["auction_id"], t, {"listing": listing, "items": len(manifest_items)}, result)
             alerts_sent += 1
 
-    # 5. Poll watchlist — snapshot bid history for watched listings
+    # 5. Poll watchlist — snapshot bid history + alert on bid spikes
     watchlist = get_watchlist()
     snapped = 0
     for wid in watchlist:
         data = fetch_listing(wid)
         if data:
-            # Upsert into listings so current state is always fresh
             upsert_listings([{**data, "auction_id": wid}])
+            prev_snap = get_bid_history(wid)
             record_bid_snapshot(wid, data)
             snapped += 1
+
+            # Bid velocity alert: fire if bid jumped >$200 or >20% since last snap
+            if prev_snap:
+                prev_bid = float(prev_snap[-1].get("current_bid") or 0)
+                curr_bid = float(data.get("current_bid") or 0)
+                bid_jump = curr_bid - prev_bid
+                bid_jump_pct = (bid_jump / prev_bid) if prev_bid else 0
+
+                if bid_jump >= 200 or bid_jump_pct >= 0.20:
+                    # Fetch listing detail for rec_max_bid context
+                    from storage.db import _client as _db_client
+                    with _db_client() as c:
+                        r = c.get(f"/bstock_listings?auction_id=eq.{wid}&select=*")
+                        full_listing = r.json()[0] if r.status_code == 200 and r.json() else data
+
+                    rec_max = full_listing.get("recommended_max_bid") or 0
+                    headroom = rec_max - curr_bid if rec_max else None
+
+                    spike_listing = {
+                        **full_listing,
+                        "title": f"⚡ BID SPIKE: {data.get('title',wid)}",
+                        "current_bid": curr_bid,
+                        "time_remaining": data.get("time_remaining"),
+                        "url": data.get("url"),
+                    }
+                    spike_summary = {
+                        **spike_listing,
+                        "title": spike_listing["title"],
+                        "msrp": full_listing.get("msrp"),
+                        "current_bid": curr_bid,
+                        "pct_of_msrp": full_listing.get("pct_of_msrp"),
+                        "per_unit": full_listing.get("per_unit"),
+                        "time_remaining": data.get("time_remaining"),
+                        "url": data.get("url"),
+                        "image_url": full_listing.get("image_url"),
+                        "location": full_listing.get("location"),
+                        "bid_jump": bid_jump,
+                        "bid_jump_pct": round(bid_jump_pct * 100, 1),
+                        "rec_max_bid": rec_max,
+                        "headroom": headroom,
+                    }
+                    send_alert({"auction_id": wid, **spike_summary, "summary": spike_summary}, "high_priority")
+                    log.warning(
+                        "BID SPIKE %s: +$%.0f (+%.0f%%) → $%.0f | headroom: $%.0f",
+                        wid, bid_jump, bid_jump_pct * 100, curr_bid, headroom or 0,
+                    )
         else:
             log.warning("Watchlist fetch failed for %s", wid)
 
