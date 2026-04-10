@@ -64,6 +64,10 @@ def download_manifest_csv(doc_url: str) -> bytes | None:
 
 def parse_manifest_csv(content: bytes) -> list[dict[str, Any]]:
     """Parse raw CSV bytes into normalized line-item dicts."""
+    # Reject binary content (PDFs, etc.) before pandas tries to parse them
+    if content[:4] == b"%PDF":
+        log.debug("Skipping PDF content (not a CSV manifest)")
+        return []
     try:
         df = pd.read_csv(io.BytesIO(content), dtype=str, keep_default_na=False)
     except Exception as exc:

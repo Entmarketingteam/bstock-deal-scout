@@ -224,7 +224,7 @@ def run(x_trigger_secret: str | None = Header(default=None)) -> dict[str, Any]:
                 params={
                     "reno_relevant": "eq.true",
                     "has_manifest": "eq.false",
-                    "select": "auction_id,url,title,storefront,current_bid,shipping_estimate,msrp",
+                    "select": "auction_id,url,title,storefront,current_bid,shipping_estimate,msrp,unit_count,condition",
                 },
             )
             reno_no_manifest = r.json() if r.status_code == 200 else []
