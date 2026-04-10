@@ -822,7 +822,8 @@ def run(x_trigger_secret: str | None = Header(default=None)) -> dict[str, Any]:
             add_to_watchlist(l["auction_id"], reason=f"auto: target storefront ({l.get('storefront','')})")
             log.info("Auto-watchlisted %s from %s", l["auction_id"], l.get("storefront"))
 
-    # 4. Proactively fetch manifests for reno-relevant new listings (don't wait for alert)
+    # 4. Proactively fetch manifests for ALL new listings (not just reno_relevant)
+    #    — any lot with a real manifest gets full quality/ROI analysis
     enrich_on = os.getenv("ENRICH_MANIFESTS", "true").lower() == "true"
     if enrich_on:
         from storage.db import _client as _db_client
@@ -830,7 +831,6 @@ def run(x_trigger_secret: str | None = Header(default=None)) -> dict[str, Any]:
             r = c.get(
                 "/bstock_listings",
                 params={
-                    "reno_relevant": "eq.true",
                     "has_manifest": "eq.false",
                     "select": "auction_id,url,title,storefront,current_bid,shipping_estimate,msrp,unit_count,condition",
                 },
