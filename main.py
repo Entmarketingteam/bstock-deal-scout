@@ -813,6 +813,15 @@ def run(x_trigger_secret: str | None = Header(default=None)) -> dict[str, Any]:
     # 3. Upsert + identify new
     new_ids = upsert_listings(listings) if listings else set()
 
+    # 3b. Auto-watchlist ALL lots from target storefronts — we want final bid data on every one
+    #     regardless of quality score or manifest status
+    WATCH_STOREFRONTS = ("winston", "kohler", "signature hardware")
+    for l in listings:
+        sf = (l.get("storefront") or "").lower()
+        if any(ws in sf for ws in WATCH_STOREFRONTS):
+            add_to_watchlist(l["auction_id"], reason=f"auto: target storefront ({l.get('storefront','')})")
+            log.info("Auto-watchlisted %s from %s", l["auction_id"], l.get("storefront"))
+
     # 4. Proactively fetch manifests for reno-relevant new listings (don't wait for alert)
     enrich_on = os.getenv("ENRICH_MANIFESTS", "true").lower() == "true"
     if enrich_on:
@@ -914,7 +923,20 @@ def run(x_trigger_secret: str | None = Header(default=None)) -> dict[str, Any]:
     snapped = 0
     for wid in watchlist:
         data = fetch_listing(wid)
-        if data:
+
+        # If fetch_listing failed or returned no current_bid, fall back to
+        # the already-stored row in bstock_listings for bid data
+        if not data or data.get("current_bid") is None:
+            from storage.db import _client
+            with _client() as c:
+                r = c.get(f"/bstock_listings?auction_id=eq.{wid}&select=auction_id,current_bid,bid_count,pct_of_msrp,time_remaining,price_label,title,storefront,url")
+                db_rows = r.json() if r.status_code == 200 else []
+            if db_rows:
+                db_row = db_rows[0]
+                data = {**(data or {}), **{k: v for k, v in db_row.items() if v is not None}}
+                log.debug("Watchlist %s: using DB fallback for bid data (current_bid=$%s)", wid, data.get("current_bid"))
+
+        if data and data.get("current_bid") is not None:
             upsert_listings([{**data, "auction_id": wid}])
             prev_snap = get_bid_history(wid)
             record_bid_snapshot(wid, data)
