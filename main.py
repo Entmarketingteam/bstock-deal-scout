@@ -555,6 +555,9 @@ def lookbook_report() -> HTMLResponse:  # noqa: C901
             except Exception:
                 mockup_urls = {}
 
+        bstock_url = l.get("url") or ""
+        # product_link = retailer/manufacturer page (publicly viewable)
+        # bstock_url = B-Stock auction page (requires B-Stock login)
         lot_data.append({
             **l,
             "landed": landed,
@@ -562,7 +565,8 @@ def lookbook_report() -> HTMLResponse:  # noqa: C901
             "per_unit_msrp": round(msrp / units, 2) if units else 0,
             "discount_pct": round((1 - landed / msrp) * 100, 1) if msrp else 0,
             "product_img": product_img or fallback_img,
-            "product_link": product_link or l.get("url", "#"),
+            "product_link": product_link or "",   # retailer URL — publicly accessible
+            "bstock_url": bstock_url,              # B-Stock auction URL — requires login
             "finish": finish,
             "mockup_urls": mockup_urls,
         })
@@ -597,27 +601,36 @@ def lookbook_report() -> HTMLResponse:  # noqa: C901
             time_display = time_val[:20] if time_val else "—"
             time_color = "#555"
 
+        # Image links to retailer page if available, otherwise non-clickable
+        img_wrap_open = f'<a href="{l["product_link"]}" target="_blank" style="text-decoration:none;display:block">' if l.get("product_link") else '<div>'
+        img_wrap_close = '</a>' if l.get("product_link") else '</div>'
+        # B-Stock auction button (login required — shown as secondary action)
+        bstock_btn = f'<a href="{l["bstock_url"]}" target="_blank" class="bstock-link">View Auction →</a>' if l.get("bstock_url") else ''
+        # Retailer button (publicly viewable)
+        retailer_btn = f'<a href="{l["product_link"]}" target="_blank" class="retailer-link">View Product →</a>' if l.get("product_link") else ''
+
         return f"""
         <div class="lot-card">
-          <a href="{l.get('url','#')}" target="_blank" style="text-decoration:none;color:inherit">
-            {img_html}
-            <div class="card-body">
-              <div class="card-title">{l.get('title','')[:70]}</div>
-              <div style="margin:6px 0">{_finish_badge(l['finish'])}</div>
-              <div class="card-stats">
-                <div><span class="stat-label">Units</span><span class="stat-val">{l.get('unit_count','—')}</span></div>
-                <div><span class="stat-label">MSRP</span><span class="stat-val">${l.get('msrp') or 0:,.0f}</span></div>
-                <div><span class="stat-label">Current Bid</span><span class="stat-val">${l.get('current_bid') or 0:,.0f}</span></div>
-                <div><span class="stat-label">$/Unit Landed</span><span class="stat-val">${l['per_unit_landed']:,.2f}</span></div>
-                <div><span class="stat-label">Savings vs MSRP</span><span class="stat-val" style="color:#16a34a;font-weight:700">{l['discount_pct']:.0f}% off</span></div>
-                <div><span class="stat-label">Resale ROI</span><span class="stat-val" style="color:{roi_color};font-weight:700">{roi_str}</span></div>
-              </div>
-              <div class="card-footer">
-                <span style="color:{time_color};font-weight:600;font-size:12px">⏱ Closes: {time_display}</span>
-                <span class="rec-bid">Max Bid: {rec_str}</span>
-              </div>
+          {img_wrap_open}{img_html}{img_wrap_close}
+          <div class="card-body">
+            <div class="card-title">{l.get('title','')[:70]}</div>
+            <div style="margin:6px 0">{_finish_badge(l['finish'])}</div>
+            <div class="card-stats">
+              <div><span class="stat-label">Units</span><span class="stat-val">{l.get('unit_count','—')}</span></div>
+              <div><span class="stat-label">MSRP</span><span class="stat-val">${l.get('msrp') or 0:,.0f}</span></div>
+              <div><span class="stat-label">Current Bid</span><span class="stat-val">${l.get('current_bid') or 0:,.0f}</span></div>
+              <div><span class="stat-label">$/Unit Landed</span><span class="stat-val">${l['per_unit_landed']:,.2f}</span></div>
+              <div><span class="stat-label">Savings vs MSRP</span><span class="stat-val" style="color:#16a34a;font-weight:700">{l['discount_pct']:.0f}% off</span></div>
+              <div><span class="stat-label">Resale ROI</span><span class="stat-val" style="color:{roi_color};font-weight:700">{roi_str}</span></div>
             </div>
-          </a>
+            <div class="card-footer">
+              <span style="color:{time_color};font-weight:600;font-size:12px">⏱ Closes: {time_display}</span>
+              <span class="rec-bid">Max Bid: {rec_str}</span>
+            </div>
+            <div class="card-actions">
+              {retailer_btn}{bstock_btn}
+            </div>
+          </div>
         </div>"""
 
     cards_html = "".join(_lot_card(l) for l in lot_data)
@@ -687,6 +700,11 @@ def lookbook_report() -> HTMLResponse:  # noqa: C901
   .stat-val {{ font-size: 13px; font-weight: 600; }}
   .card-footer {{ display: flex; justify-content: space-between; align-items: center; margin-top: 12px; padding-top: 12px; border-top: 1px solid #f0f0f0; }}
   .rec-bid {{ background: #1a1a1a; color: white; padding: 4px 10px; border-radius: 20px; font-size: 11px; font-weight: 600; }}
+  .card-actions {{ display: flex; gap: 8px; margin-top: 10px; }}
+  .retailer-link {{ flex: 1; text-align: center; padding: 7px 10px; border-radius: 6px; font-size: 11px; font-weight: 600; text-decoration: none; background: #1a1a1a; color: white; }}
+  .retailer-link:hover {{ background: #333; }}
+  .bstock-link {{ flex: 1; text-align: center; padding: 7px 10px; border-radius: 6px; font-size: 11px; font-weight: 600; text-decoration: none; background: #f0f0f0; color: #555; border: 1px solid #ddd; }}
+  .bstock-link:hover {{ background: #e5e5e5; }}
   .ai-section {{ padding: 0 48px 40px; }}
   .ai-section h2 {{ font-size: 20px; font-weight: 800; margin-bottom: 6px; }}
   .ai-section .ai-sub {{ font-size: 12px; color: #888; margin-bottom: 20px; }}
