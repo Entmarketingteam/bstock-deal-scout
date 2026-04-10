@@ -480,11 +480,12 @@ def generate_mockups(  # noqa: C901
 @app.get("/lookbook-report", response_class=HTMLResponse)
 def lookbook_report() -> HTMLResponse:  # noqa: C901
     """
-    Visual contractor lookbook — real product images, finish info, per-bathroom cost.
-    Targeted at STR developers / builders. Returns self-contained HTML.
+    Visual contractor lookbook — individual product cards per manifest item, each with
+    its own image and retailer link. Lot sections show bid/timing info above the product grid.
     Intentionally public — designed to be shared with buyers/contractors.
     """
     from storage.db import _client
+    from datetime import datetime, timezone
 
     SKIP_KEYWORDS = ("outdoor", "garden", "power equipment")
 
@@ -494,7 +495,7 @@ def lookbook_report() -> HTMLResponse:  # noqa: C901
             params={
                 "reno_relevant": "eq.true",
                 "order": "roi_score.desc.nullslast",
-                "select": "auction_id,title,msrp,current_bid,unit_count,shipping_estimate,fb_total_value,roi_score,lot_quality_score,recommended_max_bid,walk_away_price,url,location,time_remaining,image_url,ai_mockup_url",
+                "select": "auction_id,title,msrp,current_bid,unit_count,shipping_estimate,roi_score,recommended_max_bid,walk_away_price,url,location,time_remaining,image_url,ai_mockup_url",
             },
         )
         r.raise_for_status()
@@ -503,250 +504,281 @@ def lookbook_report() -> HTMLResponse:  # noqa: C901
             if not any(kw in (l.get("title") or "").lower() for kw in SKIP_KEYWORDS)
         ]
 
-        # Pull manifest items with product images for each lot
+        items_by_lot: dict[str, list] = {}
         if listings:
             ids_q = ",".join(f'"{l["auction_id"]}"' for l in listings)
             mr = c.get("/bstock_manifest_items", params={
                 "auction_id": f"in.({ids_q})",
-                "select": "auction_id,description,brand,real_image_url,real_source_url,hd_url,lowes_url,mfr_url,real_price,hd_price",
+                "order": "unit_retail.desc.nullslast",
+                "select": "auction_id,description,brand,qty,unit_retail,condition,real_image_url,real_source_url,hd_url,lowes_url,mfr_url,hd_price,lowes_price",
             })
-            items_by_lot: dict[str, list] = {}
             for it in (mr.json() if mr.status_code == 200 else []):
                 items_by_lot.setdefault(it["auction_id"], []).append(it)
-        else:
-            items_by_lot = {}
 
-    # Enrich each lot with computed fields + product image
-    lot_data = []
-    for l in listings:
+    # ── helpers ──────────────────────────────────────────────────────────────
+    def _time_info(time_val: str) -> tuple[str, str]:
+        try:
+            end_dt = datetime.fromisoformat(time_val.replace("Z", "+00:00"))
+            diff = end_dt - datetime.now(timezone.utc)
+            if diff.total_seconds() <= 0:
+                return "ENDED", "#dc2626"
+            h = int(diff.total_seconds() // 3600)
+            m = int((diff.total_seconds() % 3600) // 60)
+            color = "#dc2626" if h < 4 else ("#ca8a04" if h < 12 else "#16a34a")
+            return f"{h}h {m}m", color
+        except Exception:
+            return time_val[:16] if time_val else "—", "#888"
+
+    def _finish_badge(text: str) -> str:
+        t = text.lower()
+        if "brushed nickel" in t or "-bn" in t:
+            finish, color = "Brushed Nickel", "#7c6f5a"
+        elif "matte black" in t or "-bl" in t:
+            finish, color = "Matte Black", "#222"
+        elif "polished chrome" in t or "-cp" in t:
+            finish, color = "Polished Chrome", "#5a7c8a"
+        elif "multiple" in t or "various" in t:
+            finish, color = "Multiple Finishes", "#6b8f6b"
+        else:
+            return ""
+        return f'<span class="finish-badge" style="background:{color}">{finish}</span>'
+
+    def _retailer_links(it: dict) -> str:
+        links = []
+        if it.get("hd_url"):
+            links.append(f'<a href="{it["hd_url"]}" target="_blank" class="retailer-btn hd-btn">Home Depot</a>')
+        if it.get("lowes_url"):
+            links.append(f'<a href="{it["lowes_url"]}" target="_blank" class="retailer-btn lw-btn">Lowe\'s</a>')
+        if it.get("mfr_url") and not it.get("hd_url"):
+            links.append(f'<a href="{it["mfr_url"]}" target="_blank" class="retailer-btn mfr-btn">Manufacturer</a>')
+        if it.get("real_source_url") and not links:
+            links.append(f'<a href="{it["real_source_url"]}" target="_blank" class="retailer-btn mfr-btn">View Product</a>')
+        return "".join(links)
+
+    def _product_card(it: dict) -> str:
+        img = it.get("real_image_url") or ""
+        img_html = (
+            f'<img src="{img}" class="prod-img" loading="lazy" onerror="this.closest(\'.prod-img-wrap\').style.display=\'none\'">'
+            if img else ""
+        )
+        retail = it.get("unit_retail") or it.get("hd_price") or it.get("lowes_price") or 0
+        retail_str = f"${float(retail):,.2f}" if retail else "—"
+        qty = it.get("qty") or 1
+        brand = (it.get("brand") or "").strip()
+        desc = (it.get("description") or "").strip()
+        name = f"{brand} {desc}".strip()[:65]
+        finish_badge = _finish_badge(f"{brand} {desc} {it.get('hd_url','')}".lower())
+        links_html = _retailer_links(it)
+        return f"""
+          <div class="prod-card">
+            <div class="prod-img-wrap">{img_html}</div>
+            <div class="prod-body">
+              <div class="prod-name">{name}</div>
+              <div class="prod-meta">
+                {finish_badge}
+                <span class="prod-retail">{retail_str} retail</span>
+                <span class="prod-qty">Qty: {qty}</span>
+              </div>
+              <div class="prod-links">{links_html}</div>
+            </div>
+          </div>"""
+
+    def _lot_section(l: dict) -> str:
         aid = l["auction_id"]
         bid = float(l.get("current_bid") or 0)
         ship = float(l.get("shipping_estimate") or 300)
-        units = int(l.get("unit_count") or 1)
         msrp = float(l.get("msrp") or 0)
+        units = int(l.get("unit_count") or 1)
         landed = bid + ship
+        discount = round((1 - landed / msrp) * 100, 0) if msrp else 0
+        per_unit = round(landed / units, 2) if units else 0
+        rec = l.get("recommended_max_bid")
+        time_str, time_color = _time_info(l.get("time_remaining") or "")
+        bstock_url = l.get("url") or "#"
 
-        # Best product image: prefer real enriched image > b-stock listing image
-        items = items_by_lot.get(aid, [])
-        product_img = next((it["real_image_url"] for it in items if it.get("real_image_url")), None)
-        product_link = next(
-            (it.get("hd_url") or it.get("real_source_url") or it.get("mfr_url") for it in items if any([it.get("hd_url"), it.get("real_source_url"), it.get("mfr_url")])),
-            None,
-        )
-        fallback_img = l.get("image_url") or ""
-
-        # Finish detection from known product codes
-        finish = "Unknown"
-        title_low = (l.get("title") or "").lower()
-        if "97497-bn" in str(product_link or "").lower() or "avid hotelier" in title_low:
-            finish = "Brushed Nickel"
-        elif "margaux" in str(product_link or "").lower() or "margaux" in title_low:
-            finish = "Brushed Nickel / Polished Chrome"
-        elif "bluetooth" in title_low or "konnect" in title_low:
-            finish = "Multiple (see listing)"
-        elif "signature hardware" in title_low:
-            finish = "Multiple finishes"
-
+        # AI mockups for this lot
         mockup_urls = l.get("ai_mockup_url") or {}
         if isinstance(mockup_urls, str):
-            import json as _json
+            import json as _j
             try:
-                mockup_urls = _json.loads(mockup_urls)
+                mockup_urls = _j.loads(mockup_urls)
             except Exception:
                 mockup_urls = {}
+        mockup_html = ""
+        for key, label in [("brushed_nickel", "Brushed Nickel"), ("matte_black", "Matte Black")]:
+            u = mockup_urls.get(key)
+            if u:
+                mockup_html += f'<div class="mockup-wrap"><img src="{u}" class="mockup-img" loading="lazy"><div class="mockup-label">{label}</div></div>'
+        if mockup_html:
+            mockup_html = f'<div class="mockup-row">{mockup_html}</div>'
 
-        bstock_url = l.get("url") or ""
-        # product_link = retailer/manufacturer page (publicly viewable)
-        # bstock_url = B-Stock auction page (requires B-Stock login)
-        lot_data.append({
-            **l,
-            "landed": landed,
-            "per_unit_landed": round(landed / units, 2) if units else 0,
-            "per_unit_msrp": round(msrp / units, 2) if units else 0,
-            "discount_pct": round((1 - landed / msrp) * 100, 1) if msrp else 0,
-            "product_img": product_img or fallback_img,
-            "product_link": product_link or "",   # retailer URL — publicly accessible
-            "bstock_url": bstock_url,              # B-Stock auction URL — requires login
-            "finish": finish,
-            "mockup_urls": mockup_urls,
-        })
-
-    total_msrp = sum(float(l.get("msrp") or 0) for l in lot_data)
-    total_bid = sum(float(l.get("current_bid") or 0) for l in lot_data)
-    total_units = sum(int(l.get("unit_count") or 0) for l in lot_data)
-    avg_discount = round((1 - total_bid / total_msrp) * 100, 0) if total_msrp else 0
-
-    def _finish_badge(finish: str) -> str:
-        color = {"Brushed Nickel": "#7c6f5a", "Multiple finishes": "#6b5", "Unknown": "#aaa"}.get(finish, "#888")
-        return f'<span style="background:{color};color:#fff;padding:2px 8px;border-radius:12px;font-size:10px;font-weight:600">{finish}</span>'
-
-    def _lot_card(l: dict) -> str:
-        roi = l.get("roi_score")
-        roi_str = f"{roi:.1f}x" if roi else "—"
-        roi_color = "#16a34a" if (roi or 0) >= 3 else ("#ca8a04" if (roi or 0) >= 1 else "#888")
-        rec = l.get("recommended_max_bid")
-        rec_str = f"${rec:,.0f}" if rec else "—"
-        img_html = f'<img src="{l["product_img"]}" style="width:100%;height:180px;object-fit:contain;background:#f9f9f9;border-radius:6px 6px 0 0;padding:12px;box-sizing:border-box" onerror="this.style.display=\'none\'">' if l["product_img"] else '<div style="height:140px;background:#f0f0f0;border-radius:6px 6px 0 0;display:flex;align-items:center;justify-content:center;color:#ccc;font-size:12px">No image</div>'
-        time_val = l.get("time_remaining") or ""
-        try:
-            from datetime import datetime, timezone
-            end_dt = datetime.fromisoformat(time_val.replace("Z", "+00:00"))
-            now_utc = datetime.now(timezone.utc)
-            diff = end_dt - now_utc
-            hours = int(diff.total_seconds() // 3600)
-            mins = int((diff.total_seconds() % 3600) // 60)
-            time_display = f"{hours}h {mins}m" if diff.total_seconds() > 0 else "ENDED"
-            time_color = "#dc2626" if hours < 4 else ("#ca8a04" if hours < 12 else "#555")
-        except Exception:
-            time_display = time_val[:20] if time_val else "—"
-            time_color = "#555"
-
-        # Image links to retailer page if available, otherwise non-clickable
-        img_wrap_open = f'<a href="{l["product_link"]}" target="_blank" style="text-decoration:none;display:block">' if l.get("product_link") else '<div>'
-        img_wrap_close = '</a>' if l.get("product_link") else '</div>'
-        # B-Stock auction button (login required — shown as secondary action)
-        bstock_btn = f'<a href="{l["bstock_url"]}" target="_blank" class="bstock-link">View Auction →</a>' if l.get("bstock_url") else ''
-        # Retailer button (publicly viewable)
-        retailer_btn = f'<a href="{l["product_link"]}" target="_blank" class="retailer-link">View Product →</a>' if l.get("product_link") else ''
+        # Product cards for this lot
+        items = items_by_lot.get(aid, [])
+        prod_cards = "".join(_product_card(it) for it in items)
+        if not prod_cards:
+            # Fallback: show the lot-level image if no manifest items
+            fallback_img = l.get("image_url") or ""
+            fallback_html = f'<img src="{fallback_img}" style="height:120px;object-fit:contain;margin:16px auto;display:block" loading="lazy">' if fallback_img else ""
+            prod_cards = f'<div class="no-manifest">{fallback_html}<p>Individual product details loading — check back after next enrichment run.</p></div>'
 
         return f"""
-        <div class="lot-card">
-          {img_wrap_open}{img_html}{img_wrap_close}
-          <div class="card-body">
-            <div class="card-title">{l.get('title','')[:70]}</div>
-            <div style="margin:6px 0">{_finish_badge(l['finish'])}</div>
-            <div class="card-stats">
-              <div><span class="stat-label">Units</span><span class="stat-val">{l.get('unit_count','—')}</span></div>
-              <div><span class="stat-label">MSRP</span><span class="stat-val">${l.get('msrp') or 0:,.0f}</span></div>
-              <div><span class="stat-label">Current Bid</span><span class="stat-val">${l.get('current_bid') or 0:,.0f}</span></div>
-              <div><span class="stat-label">$/Unit Landed</span><span class="stat-val">${l['per_unit_landed']:,.2f}</span></div>
-              <div><span class="stat-label">Savings vs MSRP</span><span class="stat-val" style="color:#16a34a;font-weight:700">{l['discount_pct']:.0f}% off</span></div>
-              <div><span class="stat-label">Resale ROI</span><span class="stat-val" style="color:{roi_color};font-weight:700">{roi_str}</span></div>
-            </div>
-            <div class="card-footer">
-              <span style="color:{time_color};font-weight:600;font-size:12px">⏱ Closes: {time_display}</span>
-              <span class="rec-bid">Max Bid: {rec_str}</span>
-            </div>
-            <div class="card-actions">
-              {retailer_btn}{bstock_btn}
+      <div class="lot-section">
+        <div class="lot-header">
+          <div class="lot-header-left">
+            <div class="lot-title">{l.get('title','')[:80]}</div>
+            <div class="lot-pills">
+              <span class="pill">📦 {units} units</span>
+              <span class="pill">💵 MSRP ${msrp:,.0f}</span>
+              <span class="pill green">🏷 {discount:.0f}% below MSRP</span>
+              <span class="pill">📍 {l.get('location') or '—'}</span>
             </div>
           </div>
-        </div>"""
-
-    cards_html = "".join(_lot_card(l) for l in lot_data)
-
-    # Build AI renders section
-    FINISH_LABELS = {
-        "brushed_nickel": "Brushed Nickel",
-        "matte_black": "Matte Black",
-        "polished_chrome": "Polished Chrome",
-    }
-    ai_cards = []
-    for l in lot_data:
-        mockups = l.get("mockup_urls") or {}
-        short_title = (l.get("title") or "")[:45]
-        for key, label in FINISH_LABELS.items():
-            url = mockups.get(key)
-            if url:
-                ai_cards.append(f"""
-        <div class="ai-card">
-          <img src="{url}" alt="AI render: {short_title} — {label}" loading="lazy"
-               onerror="this.parentElement.style.display='none'">
-          <div class="ai-card-body">
-            <div class="ai-card-label">{label}</div>
-            <div class="ai-card-sub">{short_title}</div>
+          <div class="lot-header-right">
+            <div class="lot-bid">${bid:,.0f}<span class="lot-bid-label">current bid</span></div>
+            <div class="lot-per-unit">${per_unit:,.2f}/unit landed</div>
+            <div style="color:{time_color};font-weight:700;font-size:13px;margin-top:4px">⏱ {time_str}</div>
+            {f'<div class="rec-bid-pill">Max bid: ${rec:,.0f}</div>' if rec else ''}
+            <a href="{bstock_url}" target="_blank" class="bstock-auction-btn">View on B-Stock →</a>
           </div>
-        </div>""")
+        </div>
+        {mockup_html}
+        <div class="prod-grid">
+          {prod_cards}
+        </div>
+      </div>"""
 
-    if ai_cards:
-        ai_section_html = f"""<div class="ai-section">
-  <h2>AI Bathroom Visualizations</h2>
-  <div class="ai-sub">DALL-E 3 renders showing these fixtures installed in a mountain cabin bathroom</div>
-  <div class="ai-grid">{''.join(ai_cards)}</div>
-</div>"""
+    # ── aggregate stats ───────────────────────────────────────────────────────
+    total_msrp = sum(float(l.get("msrp") or 0) for l in listings)
+    total_bid = sum(float(l.get("current_bid") or 0) for l in listings)
+    total_units = sum(int(l.get("unit_count") or 0) for l in listings)
+    avg_discount = round((1 - total_bid / total_msrp) * 100, 0) if total_msrp else 0
+    total_products = sum(len(v) for v in items_by_lot.values())
+
+    sections_html = "".join(_lot_section(l) for l in listings)
+
+    # ── AI renders standalone section (full-width at bottom) ──────────────────
+    ai_cards_html = ""
+    for l in listings:
+        mockup_urls = l.get("ai_mockup_url") or {}
+        if isinstance(mockup_urls, str):
+            import json as _j
+            try:
+                mockup_urls = _j.loads(mockup_urls)
+            except Exception:
+                mockup_urls = {}
+        short = (l.get("title") or "")[:40]
+        for key, label in [("brushed_nickel", "Brushed Nickel"), ("matte_black", "Matte Black")]:
+            u = mockup_urls.get(key)
+            if u:
+                ai_cards_html += f'<div class="ai-card"><img src="{u}" loading="lazy"><div class="ai-card-body"><div class="ai-card-label">{label}</div><div class="ai-card-sub">{short}</div></div></div>'
+
+    if ai_cards_html:
+        ai_section = f'<div class="ai-section"><h2>AI Bathroom Visualizations</h2><p class="ai-sub">DALL-E 3 renders — these fixtures installed in a mountain cabin bathroom</p><div class="ai-grid">{ai_cards_html}</div></div>'
     else:
-        ai_section_html = """<div class="ai-section">
-  <div class="ai-cta">
-    <strong>AI Bathroom Mockups — coming soon</strong><br>
-    Hit <code>POST /generate-mockups</code> to generate DALL-E 3 renders of these fixtures in a cabin bathroom.
-    ~$0.08 per lot, results cached permanently. Takes ~60 seconds.
-  </div>
-</div>"""
+        ai_section = ""
 
     html = f"""<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Kohler Hardware Lots — Contractor Lookbook</title>
+<title>Kohler + Signature Hardware — Contractor Lookbook</title>
 <style>
-  * {{ box-sizing: border-box; margin: 0; padding: 0; }}
-  body {{ font-family: -apple-system, 'Helvetica Neue', Arial, sans-serif; background: #f8f8f6; color: #1a1a1a; }}
-  .header {{ background: #1a1a1a; color: white; padding: 40px 48px 32px; }}
-  .header h1 {{ font-size: 30px; font-weight: 800; letter-spacing: -0.5px; }}
-  .header .sub {{ color: #999; font-size: 14px; margin-top: 6px; }}
-  .stats-bar {{ background: white; border-bottom: 1px solid #eee; padding: 20px 48px; display: flex; gap: 48px; }}
-  .s {{ text-align: center; }}
-  .s .lbl {{ font-size: 10px; text-transform: uppercase; letter-spacing: 0.5px; color: #999; }}
-  .s .val {{ font-size: 22px; font-weight: 800; margin-top: 2px; }}
-  .pitch-bar {{ background: #fffbeb; border-bottom: 1px solid #fde68a; padding: 16px 48px; font-size: 13px; color: #78350f; line-height: 1.5; }}
-  .grid {{ display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 20px; padding: 32px 48px; max-width: 1400px; }}
-  .lot-card {{ background: white; border-radius: 10px; overflow: hidden; box-shadow: 0 1px 4px rgba(0,0,0,.08); transition: box-shadow .15s; }}
-  .lot-card:hover {{ box-shadow: 0 4px 16px rgba(0,0,0,.12); }}
-  .card-body {{ padding: 16px; }}
-  .card-title {{ font-size: 13px; font-weight: 600; line-height: 1.4; margin-bottom: 8px; color: #1a1a1a; }}
-  .card-stats {{ display: grid; grid-template-columns: 1fr 1fr; gap: 6px 16px; margin: 12px 0; }}
-  .stat-label {{ font-size: 10px; text-transform: uppercase; letter-spacing: 0.4px; color: #999; display: block; }}
-  .stat-val {{ font-size: 13px; font-weight: 600; }}
-  .card-footer {{ display: flex; justify-content: space-between; align-items: center; margin-top: 12px; padding-top: 12px; border-top: 1px solid #f0f0f0; }}
-  .rec-bid {{ background: #1a1a1a; color: white; padding: 4px 10px; border-radius: 20px; font-size: 11px; font-weight: 600; }}
-  .card-actions {{ display: flex; gap: 8px; margin-top: 10px; }}
-  .retailer-link {{ flex: 1; text-align: center; padding: 7px 10px; border-radius: 6px; font-size: 11px; font-weight: 600; text-decoration: none; background: #1a1a1a; color: white; }}
-  .retailer-link:hover {{ background: #333; }}
-  .bstock-link {{ flex: 1; text-align: center; padding: 7px 10px; border-radius: 6px; font-size: 11px; font-weight: 600; text-decoration: none; background: #f0f0f0; color: #555; border: 1px solid #ddd; }}
-  .bstock-link:hover {{ background: #e5e5e5; }}
-  .ai-section {{ padding: 0 48px 40px; }}
-  .ai-section h2 {{ font-size: 20px; font-weight: 800; margin-bottom: 6px; }}
-  .ai-section .ai-sub {{ font-size: 12px; color: #888; margin-bottom: 20px; }}
-  .ai-grid {{ display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 16px; }}
-  .ai-card {{ background: white; border-radius: 10px; overflow: hidden; box-shadow: 0 1px 4px rgba(0,0,0,.08); }}
-  .ai-card img {{ width: 100%; height: 220px; object-fit: cover; display: block; }}
-  .ai-card-body {{ padding: 12px 14px; }}
-  .ai-card-label {{ font-size: 12px; font-weight: 700; color: #1a1a1a; }}
-  .ai-card-sub {{ font-size: 11px; color: #888; margin-top: 2px; }}
-  .ai-cta {{ background: #ede9fe; border: 1px solid #c4b5fd; border-radius: 10px; padding: 20px 24px; margin-top: 20px; font-size: 13px; color: #4c1d95; }}
-  footer {{ padding: 32px 48px; font-size: 11px; color: #aaa; border-top: 1px solid #eee; background: white; }}
+  *{{box-sizing:border-box;margin:0;padding:0}}
+  body{{font-family:-apple-system,'Helvetica Neue',Arial,sans-serif;background:#f4f4f2;color:#1a1a1a}}
+  a{{color:inherit}}
+  /* ── Header ── */
+  .header{{background:#1a1a1a;color:#fff;padding:36px 48px 28px}}
+  .header h1{{font-size:28px;font-weight:800;letter-spacing:-.5px}}
+  .header .sub{{color:#888;font-size:13px;margin-top:5px}}
+  /* ── Stats bar ── */
+  .stats-bar{{background:#fff;border-bottom:1px solid #eee;padding:18px 48px;display:flex;gap:40px;flex-wrap:wrap}}
+  .s{{text-align:center}}
+  .s .lbl{{font-size:9px;text-transform:uppercase;letter-spacing:.6px;color:#aaa}}
+  .s .val{{font-size:20px;font-weight:800;margin-top:2px}}
+  /* ── Pitch bar ── */
+  .pitch-bar{{background:#fffbeb;border-bottom:1px solid #fde68a;padding:14px 48px;font-size:13px;color:#78350f;line-height:1.5}}
+  /* ── Lot section ── */
+  .lot-section{{background:#fff;margin:24px 48px;border-radius:12px;box-shadow:0 1px 6px rgba(0,0,0,.07);overflow:hidden}}
+  .lot-header{{display:flex;justify-content:space-between;align-items:flex-start;padding:20px 24px;background:#fafafa;border-bottom:1px solid #eee;gap:20px;flex-wrap:wrap}}
+  .lot-header-left{{flex:1;min-width:200px}}
+  .lot-title{{font-size:15px;font-weight:700;line-height:1.4;margin-bottom:10px}}
+  .lot-pills{{display:flex;flex-wrap:wrap;gap:6px}}
+  .pill{{background:#f0f0f0;padding:3px 10px;border-radius:20px;font-size:11px;font-weight:500;color:#444}}
+  .pill.green{{background:#dcfce7;color:#166534}}
+  .lot-header-right{{text-align:right;flex-shrink:0}}
+  .lot-bid{{font-size:26px;font-weight:800;line-height:1}}
+  .lot-bid-label{{font-size:10px;color:#aaa;font-weight:400;margin-left:4px;text-transform:uppercase}}
+  .lot-per-unit{{font-size:11px;color:#888;margin-top:3px}}
+  .rec-bid-pill{{display:inline-block;margin-top:6px;background:#1a1a1a;color:#fff;padding:3px 10px;border-radius:20px;font-size:11px;font-weight:600}}
+  .bstock-auction-btn{{display:inline-block;margin-top:8px;padding:6px 14px;border-radius:6px;font-size:11px;font-weight:600;text-decoration:none;background:#f0f0f0;color:#555;border:1px solid #ddd}}
+  .bstock-auction-btn:hover{{background:#e5e5e5}}
+  /* ── AI mockup row ── */
+  .mockup-row{{display:flex;gap:12px;padding:16px 24px;background:#f9f8ff;border-bottom:1px solid #ede9fe;overflow-x:auto}}
+  .mockup-wrap{{flex-shrink:0;text-align:center}}
+  .mockup-img{{width:280px;height:200px;object-fit:cover;border-radius:8px;display:block}}
+  .mockup-label{{font-size:10px;color:#7c3aed;font-weight:600;margin-top:5px;text-transform:uppercase;letter-spacing:.4px}}
+  /* ── Product grid ── */
+  .prod-grid{{display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:1px;background:#eee}}
+  .prod-card{{background:#fff;padding:16px;display:flex;flex-direction:column;gap:10px}}
+  .prod-img-wrap{{height:140px;display:flex;align-items:center;justify-content:center;background:#f9f9f9;border-radius:6px;overflow:hidden}}
+  .prod-img{{max-width:100%;max-height:140px;object-fit:contain}}
+  .prod-body{{flex:1;display:flex;flex-direction:column;gap:6px}}
+  .prod-name{{font-size:12px;font-weight:600;line-height:1.4;color:#1a1a1a}}
+  .prod-meta{{display:flex;flex-wrap:wrap;gap:4px;align-items:center}}
+  .finish-badge{{font-size:9px;font-weight:700;color:#fff;padding:2px 7px;border-radius:10px;text-transform:uppercase;letter-spacing:.3px}}
+  .prod-retail{{font-size:12px;font-weight:700;color:#16a34a}}
+  .prod-qty{{font-size:10px;color:#888}}
+  .prod-links{{display:flex;flex-wrap:wrap;gap:5px;margin-top:auto}}
+  .retailer-btn{{padding:5px 10px;border-radius:5px;font-size:10px;font-weight:700;text-decoration:none;text-transform:uppercase;letter-spacing:.3px}}
+  .hd-btn{{background:#f96302;color:#fff}}
+  .hd-btn:hover{{background:#e05600}}
+  .lw-btn{{background:#004990;color:#fff}}
+  .lw-btn:hover{{background:#003870}}
+  .mfr-btn{{background:#333;color:#fff}}
+  .mfr-btn:hover{{background:#111}}
+  .no-manifest{{padding:24px;color:#aaa;font-size:12px;text-align:center}}
+  /* ── AI section ── */
+  .ai-section{{padding:32px 48px 40px}}
+  .ai-section h2{{font-size:18px;font-weight:800;margin-bottom:4px}}
+  .ai-sub{{font-size:12px;color:#888;margin-bottom:16px}}
+  .ai-grid{{display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:16px}}
+  .ai-card{{background:#fff;border-radius:10px;overflow:hidden;box-shadow:0 1px 4px rgba(0,0,0,.08)}}
+  .ai-card img{{width:100%;height:200px;object-fit:cover;display:block}}
+  .ai-card-body{{padding:10px 14px}}
+  .ai-card-label{{font-size:12px;font-weight:700}}
+  .ai-card-sub{{font-size:10px;color:#888;margin-top:2px}}
+  /* ── Footer ── */
+  footer{{padding:28px 48px;font-size:11px;color:#aaa;border-top:1px solid #eee;background:#fff}}
 </style>
 </head>
 <body>
 
 <div class="header">
   <h1>Kohler + Signature Hardware</h1>
-  <div class="sub">B-Stock Liquidation Lots · All New Condition · Sourced for STR &amp; Cabin Developers</div>
+  <div class="sub">B-Stock Liquidation · All New Condition · Sourced for STR &amp; Cabin Developers</div>
 </div>
 
 <div class="stats-bar">
   <div class="s"><div class="lbl">Total MSRP</div><div class="val">${total_msrp:,.0f}</div></div>
-  <div class="s"><div class="lbl">Total Bid (so far)</div><div class="val">${total_bid:,.0f}</div></div>
+  <div class="s"><div class="lbl">Current Bid</div><div class="val">${total_bid:,.0f}</div></div>
   <div class="s"><div class="lbl">Total Units</div><div class="val">{total_units:,}</div></div>
   <div class="s"><div class="lbl">Avg Discount</div><div class="val">{avg_discount:.0f}%+</div></div>
-  <div class="s"><div class="lbl">Lots Available</div><div class="val">{len(lot_data)}</div></div>
+  <div class="s"><div class="lbl">Lots</div><div class="val">{len(listings)}</div></div>
+  <div class="s"><div class="lbl">Individual Products</div><div class="val">{total_products}</div></div>
 </div>
 
 <div class="pitch-bar">
-  <strong>Who this is for:</strong> Building 10–50 unit STR cabins or lake houses? These Kohler lots let you outfit every bathroom
-  with matching premium hardware at under 5% of retail. Enough inventory to cover 50–200 rooms.
-  Confirmed finish on towel bars: <strong>Brushed Nickel</strong> — the most universally matched finish for mountain/cabin builds.
+  <strong>Who this is for:</strong> Building 10–50 unit STR cabins? These Kohler lots let you outfit every bathroom with matching premium hardware at pennies on the dollar.
+  Confirmed finish on towel bars &amp; accessories: <strong>Brushed Nickel</strong> — universally matched for mountain/cabin builds. Each product links directly to Home Depot or Lowe's for specs.
 </div>
 
-<div class="grid">
-{cards_html}
-</div>
+{sections_html}
 
-{ai_section_html}
+{ai_section}
 
 <footer>
-  Generated by B-Stock Deal Scout · Live auction data · Refreshed every 15 min · Prices and time remaining update automatically
+  B-Stock Deal Scout · Live auction data · Each product card links to the manufacturer/retailer page · B-Stock links require a buyer account
 </footer>
 
 </body>
