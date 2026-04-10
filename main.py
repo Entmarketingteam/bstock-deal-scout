@@ -152,14 +152,15 @@ def bundle_deals(x_trigger_secret: str | None = Header(default=None)) -> dict[st
     classified = []
     for row in listings:
         cats = _categorize(row)
-        bid = float(row.get("current_bid") or 0)
-        ship = float(row.get("shipping_estimate") or 300)
+        lc = landed_cost(row)
         units = int(row.get("unit_count") or 1)
         classified.append({
             **row,
             "categories": cats,
-            "landed_cost": bid + ship,
-            "per_unit_cost": round((bid + ship) / units, 2) if units else 0,
+            "landed_cost": lc["total_landed"],
+            "bstock_fee": lc["bstock_fee"],
+            "shipping_estimate": lc["shipping_estimate"],
+            "per_unit_cost": lc["per_unit_landed"],
             "per_unit_msrp": round(float(row.get("msrp") or 0) / units, 2) if units else 0,
         })
 
@@ -496,7 +497,7 @@ def lookbook_report() -> HTMLResponse:  # noqa: C901
             params={
                 "reno_relevant": "eq.true",
                 "order": "roi_score.desc.nullslast",
-                "select": "auction_id,title,msrp,current_bid,unit_count,shipping_estimate,roi_score,recommended_max_bid,walk_away_price,url,location,time_remaining,image_url,ai_mockup_url",
+                "select": "auction_id,title,storefront,msrp,current_bid,unit_count,shipping_estimate,roi_score,recommended_max_bid,walk_away_price,url,location,time_remaining,image_url,ai_mockup_url",
             },
         )
         r.raise_for_status()
@@ -585,14 +586,17 @@ def lookbook_report() -> HTMLResponse:  # noqa: C901
           </div>"""
 
     def _lot_section(l: dict) -> str:
+        from enrichment.shipping import landed_cost as _lc
         aid = l["auction_id"]
-        bid = float(l.get("current_bid") or 0)
-        ship = float(l.get("shipping_estimate") or 300)
-        msrp = float(l.get("msrp") or 0)
+        lc = _lc(l)
+        bid = lc["bid"]
+        bstock_fee = lc["bstock_fee"]
+        ship = lc["shipping_estimate"]
+        total_landed = lc["total_landed"]
+        per_unit = lc["per_unit_landed"]
+        msrp = lc["msrp"]
         units = int(l.get("unit_count") or 1)
-        landed = bid + ship
-        discount = round((1 - landed / msrp) * 100, 0) if msrp else 0
-        per_unit = round(landed / units, 2) if units else 0
+        discount = round((1 - total_landed / msrp) * 100, 0) if msrp else 0
         rec = l.get("recommended_max_bid")
         time_str, time_color = _time_info(l.get("time_remaining") or "")
         bstock_url = l.get("url") or "#"
@@ -632,7 +636,12 @@ def lookbook_report() -> HTMLResponse:  # noqa: C901
             </div>
           </div>
           <div class="lot-header-right">
-            <div class="lot-bid">${bid:,.0f}<span class="lot-bid-label">current bid</span></div>
+            <div class="lot-bid">${bid:,.0f}<span class="lot-bid-label">winning bid</span></div>
+            <div class="cost-breakdown">
+              <span class="cost-line">+ ${bstock_fee:,.0f} B-Stock fee ({lc['bstock_fee_pct']:.0f}%)</span>
+              <span class="cost-line">+ ${ship:,.0f} est. freight</span>
+              <span class="cost-total">= ${total_landed:,.0f} total landed</span>
+            </div>
             <div class="lot-per-unit">${per_unit:,.2f}/unit landed</div>
             <div style="color:{time_color};font-weight:700;font-size:13px;margin-top:4px">⏱ {time_str}</div>
             {f'<div class="rec-bid-pill">Max bid: ${rec:,.0f}</div>' if rec else ''}
@@ -707,6 +716,9 @@ def lookbook_report() -> HTMLResponse:  # noqa: C901
   .lot-header-right{{text-align:right;flex-shrink:0}}
   .lot-bid{{font-size:26px;font-weight:800;line-height:1}}
   .lot-bid-label{{font-size:10px;color:#aaa;font-weight:400;margin-left:4px;text-transform:uppercase}}
+  .cost-breakdown{{margin-top:4px;display:flex;flex-direction:column;gap:1px}}
+  .cost-line{{font-size:11px;color:#999}}
+  .cost-total{{font-size:12px;font-weight:700;color:#111;border-top:1px solid #e0e0e0;padding-top:2px;margin-top:2px}}
   .lot-per-unit{{font-size:11px;color:#888;margin-top:3px}}
   .rec-bid-pill{{display:inline-block;margin-top:6px;background:#1a1a1a;color:#fff;padding:3px 10px;border-radius:20px;font-size:11px;font-weight:600}}
   .bstock-auction-btn{{display:inline-block;margin-top:8px;padding:6px 14px;border-radius:6px;font-size:11px;font-weight:600;text-decoration:none;background:#f0f0f0;color:#555;border:1px solid #ddd}}

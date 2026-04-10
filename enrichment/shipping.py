@@ -95,18 +95,44 @@ def estimate_shipping(listing: dict[str, Any]) -> float | None:
     return round(per_pallet * pallets + liftgate, 2)
 
 
+# B-Stock buyer's premium by storefront (% of winning bid, charged at checkout)
+# Source: B-Stock storefront terms. Default 15% when unknown.
+_BSTOCK_BUYER_PREMIUM: dict[str, float] = {
+    "winston": 0.10,        # Winston Water Cooler — 10%
+    "winston water cooler": 0.10,
+    "kohler": 0.15,         # Kohler brand storefront — 15%
+    "signature hardware": 0.15,
+}
+_DEFAULT_BUYER_PREMIUM = 0.15
+
+
+def buyer_premium_rate(listing: dict[str, Any]) -> float:
+    """Return the B-Stock buyer's premium rate (0.0–1.0) for this listing's storefront."""
+    storefront = (listing.get("storefront") or "").lower()
+    for key, rate in _BSTOCK_BUYER_PREMIUM.items():
+        if key in storefront:
+            return rate
+    return _DEFAULT_BUYER_PREMIUM
+
+
 def landed_cost(listing: dict[str, Any]) -> dict[str, Any]:
-    """Return breakdown: bid + shipping = landed cost + ROI inputs."""
+    """Full cost breakdown: bid + buyer's premium + shipping = total landed cost."""
     bid = float(listing.get("current_bid") or 0)
+    premium_rate = buyer_premium_rate(listing)
+    bstock_fee = round(bid * premium_rate, 2)
     shipping = estimate_shipping(listing) or 0
-    total = bid + shipping
+    total = bid + bstock_fee + shipping
     msrp = float(listing.get("msrp") or 0)
     fb_total = float(listing.get("fb_total_value") or 0)
+    units = max(1, int(listing.get("unit_count") or 1))
 
     result = {
         "bid": bid,
+        "bstock_fee": bstock_fee,
+        "bstock_fee_pct": round(premium_rate * 100, 1),
         "shipping_estimate": shipping,
-        "landed_cost": total,
+        "total_landed": total,
+        "per_unit_landed": round(total / units, 2),
         "msrp": msrp,
         "pct_of_msrp_landed": round((total / msrp * 100), 2) if msrp else None,
     }
@@ -114,6 +140,6 @@ def landed_cost(listing: dict[str, Any]) -> dict[str, Any]:
         profit = fb_total - total
         roi = round((profit / total) * 100, 1) if total else None
         result["fb_total_value"] = fb_total
-        result["estimated_profit"] = profit
+        result["estimated_profit"] = round(profit, 2)
         result["roi_pct"] = roi
     return result
