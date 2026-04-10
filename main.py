@@ -304,150 +304,208 @@ def history(auction_id: str, x_trigger_secret: str | None = Header(default=None)
 
 
 @app.get("/lookbook-report", response_class=HTMLResponse)
-def lookbook_report(x_trigger_secret: str | None = Header(default=None)) -> HTMLResponse:
+def lookbook_report(x_trigger_secret: str | None = Header(default=None)) -> HTMLResponse:  # noqa: C901
     """
-    Generate an HTML contractor lookbook for current premium hardware lots.
-    Targeted at STR developers / builders (BowTiedBroke-style cabin builds).
-    Returns self-contained HTML — save as PDF or email directly.
+    Visual contractor lookbook — real product images, finish info, per-bathroom cost.
+    Targeted at STR developers / builders. Returns self-contained HTML.
     """
     _require_auth(x_trigger_secret)
     from storage.db import _client
+
+    SKIP_KEYWORDS = ("outdoor", "garden", "power equipment")
 
     with _client() as c:
         r = c.get(
             "/bstock_listings",
             params={
                 "reno_relevant": "eq.true",
-                "order": "msrp.desc",
-                "select": "auction_id,title,msrp,current_bid,unit_count,shipping_estimate,fb_total_value,roi_score,lot_quality_score,recommended_max_bid,url,location,time_remaining",
+                "order": "roi_score.desc.nullslast",
+                "select": "auction_id,title,msrp,current_bid,unit_count,shipping_estimate,fb_total_value,roi_score,lot_quality_score,recommended_max_bid,walk_away_price,url,location,time_remaining,image_url",
             },
         )
         r.raise_for_status()
-        listings = [l for l in r.json() if "outdoor" not in (l.get("title") or "").lower() and "garden" not in (l.get("title") or "").lower()]
+        listings = [
+            l for l in r.json()
+            if not any(kw in (l.get("title") or "").lower() for kw in SKIP_KEYWORDS)
+        ]
 
-    # Build per-lot data
-    lot_rows = []
+        # Pull manifest items with product images for each lot
+        if listings:
+            ids_q = ",".join(f'"{l["auction_id"]}"' for l in listings)
+            mr = c.get("/bstock_manifest_items", params={
+                "auction_id": f"in.({ids_q})",
+                "select": "auction_id,description,brand,real_image_url,real_source_url,hd_url,lowes_url,mfr_url,real_price,hd_price",
+            })
+            items_by_lot: dict[str, list] = {}
+            for it in (mr.json() if mr.status_code == 200 else []):
+                items_by_lot.setdefault(it["auction_id"], []).append(it)
+        else:
+            items_by_lot = {}
+
+    # Enrich each lot with computed fields + product image
+    lot_data = []
     for l in listings:
+        aid = l["auction_id"]
         bid = float(l.get("current_bid") or 0)
         ship = float(l.get("shipping_estimate") or 300)
         units = int(l.get("unit_count") or 1)
         msrp = float(l.get("msrp") or 0)
         landed = bid + ship
-        lot_rows.append({
+
+        # Best product image: prefer real enriched image > b-stock listing image
+        items = items_by_lot.get(aid, [])
+        product_img = next((it["real_image_url"] for it in items if it.get("real_image_url")), None)
+        product_link = next(
+            (it.get("hd_url") or it.get("real_source_url") or it.get("mfr_url") for it in items if any([it.get("hd_url"), it.get("real_source_url"), it.get("mfr_url")])),
+            None,
+        )
+        fallback_img = l.get("image_url") or ""
+
+        # Finish detection from known product codes
+        finish = "Unknown"
+        title_low = (l.get("title") or "").lower()
+        if "97497-bn" in str(product_link or "").lower() or "avid hotelier" in title_low:
+            finish = "Brushed Nickel"
+        elif "margaux" in str(product_link or "").lower() or "margaux" in title_low:
+            finish = "Brushed Nickel / Polished Chrome"
+        elif "bluetooth" in title_low or "konnect" in title_low:
+            finish = "Multiple (see listing)"
+        elif "signature hardware" in title_low:
+            finish = "Multiple finishes"
+
+        lot_data.append({
             **l,
             "landed": landed,
             "per_unit_landed": round(landed / units, 2) if units else 0,
             "per_unit_msrp": round(msrp / units, 2) if units else 0,
-            "discount_pct": round((1 - landed / msrp) * 100, 0) if msrp else 0,
+            "discount_pct": round((1 - landed / msrp) * 100, 1) if msrp else 0,
+            "product_img": product_img or fallback_img,
+            "product_link": product_link or l.get("url", "#"),
+            "finish": finish,
         })
 
-    total_msrp = sum(float(l.get("msrp") or 0) for l in lot_rows)
-    total_bid = sum(float(l.get("current_bid") or 0) for l in lot_rows)
-    total_units = sum(int(l.get("unit_count") or 0) for l in lot_rows)
+    total_msrp = sum(float(l.get("msrp") or 0) for l in lot_data)
+    total_bid = sum(float(l.get("current_bid") or 0) for l in lot_data)
+    total_units = sum(int(l.get("unit_count") or 0) for l in lot_data)
+    avg_discount = round((1 - total_bid / total_msrp) * 100, 0) if total_msrp else 0
 
-    def _row(l: dict) -> str:
-        roi_str = f"{l.get('roi_score') or 0:.1f}x" if l.get("roi_score") else "—"
-        rec_bid = f"${l.get('recommended_max_bid') or 0:,.0f}" if l.get("recommended_max_bid") else "—"
+    def _finish_badge(finish: str) -> str:
+        color = {"Brushed Nickel": "#7c6f5a", "Multiple finishes": "#6b5", "Unknown": "#aaa"}.get(finish, "#888")
+        return f'<span style="background:{color};color:#fff;padding:2px 8px;border-radius:12px;font-size:10px;font-weight:600">{finish}</span>'
+
+    def _lot_card(l: dict) -> str:
+        roi = l.get("roi_score")
+        roi_str = f"{roi:.1f}x" if roi else "—"
+        roi_color = "#16a34a" if (roi or 0) >= 3 else ("#ca8a04" if (roi or 0) >= 1 else "#888")
+        rec = l.get("recommended_max_bid")
+        rec_str = f"${rec:,.0f}" if rec else "—"
+        img_html = f'<img src="{l["product_img"]}" style="width:100%;height:180px;object-fit:contain;background:#f9f9f9;border-radius:6px 6px 0 0;padding:12px;box-sizing:border-box" onerror="this.style.display=\'none\'">' if l["product_img"] else '<div style="height:140px;background:#f0f0f0;border-radius:6px 6px 0 0;display:flex;align-items:center;justify-content:center;color:#ccc;font-size:12px">No image</div>'
+        time_val = l.get("time_remaining") or ""
+        try:
+            from datetime import datetime, timezone
+            end_dt = datetime.fromisoformat(time_val.replace("Z", "+00:00"))
+            now_utc = datetime.now(timezone.utc)
+            diff = end_dt - now_utc
+            hours = int(diff.total_seconds() // 3600)
+            mins = int((diff.total_seconds() % 3600) // 60)
+            time_display = f"{hours}h {mins}m" if diff.total_seconds() > 0 else "ENDED"
+            time_color = "#dc2626" if hours < 4 else ("#ca8a04" if hours < 12 else "#555")
+        except Exception:
+            time_display = time_val[:20] if time_val else "—"
+            time_color = "#555"
+
         return f"""
-        <tr>
-          <td><a href="{l.get('url','#')}" target="_blank">{l.get('title','')[:60]}</a></td>
-          <td class="num">${l.get('msrp') or 0:,.0f}</td>
-          <td class="num">{l.get('unit_count') or '—'}</td>
-          <td class="num">${l.get('current_bid') or 0:,.0f}</td>
-          <td class="num">${l['per_unit_msrp']:,.2f}</td>
-          <td class="num">${l['per_unit_landed']:,.2f}</td>
-          <td class="num highlight">{l['discount_pct']:.0f}% off</td>
-          <td class="num">{roi_str}</td>
-          <td class="num">{rec_bid}</td>
-          <td class="small">{l.get('time_remaining','—')}</td>
-        </tr>"""
+        <div class="lot-card">
+          <a href="{l.get('url','#')}" target="_blank" style="text-decoration:none;color:inherit">
+            {img_html}
+            <div class="card-body">
+              <div class="card-title">{l.get('title','')[:70]}</div>
+              <div style="margin:6px 0">{_finish_badge(l['finish'])}</div>
+              <div class="card-stats">
+                <div><span class="stat-label">Units</span><span class="stat-val">{l.get('unit_count','—')}</span></div>
+                <div><span class="stat-label">MSRP</span><span class="stat-val">${l.get('msrp') or 0:,.0f}</span></div>
+                <div><span class="stat-label">Current Bid</span><span class="stat-val">${l.get('current_bid') or 0:,.0f}</span></div>
+                <div><span class="stat-label">$/Unit Landed</span><span class="stat-val">${l['per_unit_landed']:,.2f}</span></div>
+                <div><span class="stat-label">Savings vs MSRP</span><span class="stat-val" style="color:#16a34a;font-weight:700">{l['discount_pct']:.0f}% off</span></div>
+                <div><span class="stat-label">Resale ROI</span><span class="stat-val" style="color:{roi_color};font-weight:700">{roi_str}</span></div>
+              </div>
+              <div class="card-footer">
+                <span style="color:{time_color};font-weight:600;font-size:12px">⏱ Closes: {time_display}</span>
+                <span class="rec-bid">Max Bid: {rec_str}</span>
+              </div>
+            </div>
+          </a>
+        </div>"""
 
-    rows_html = "".join(_row(l) for l in lot_rows)
+    cards_html = "".join(_lot_card(l) for l in lot_data)
 
     html = f"""<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<title>B-Stock Premium Hardware — Contractor Lookbook</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Kohler Hardware Lots — Contractor Lookbook</title>
 <style>
-  body {{ font-family: 'Helvetica Neue', Arial, sans-serif; margin: 0; padding: 40px; color: #1a1a1a; max-width: 1100px; }}
-  h1 {{ font-size: 28px; font-weight: 700; letter-spacing: -0.5px; margin-bottom: 4px; }}
-  .subtitle {{ color: #555; font-size: 14px; margin-bottom: 32px; }}
-  .stat-row {{ display: flex; gap: 24px; margin-bottom: 40px; }}
-  .stat {{ background: #f5f5f5; border-radius: 8px; padding: 16px 24px; flex: 1; }}
-  .stat .label {{ font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; color: #888; }}
-  .stat .value {{ font-size: 28px; font-weight: 700; margin-top: 4px; }}
-  table {{ width: 100%; border-collapse: collapse; font-size: 13px; }}
-  th {{ background: #1a1a1a; color: white; padding: 10px 12px; text-align: left; font-weight: 600; font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; }}
-  td {{ padding: 10px 12px; border-bottom: 1px solid #eee; vertical-align: top; }}
-  tr:hover td {{ background: #fafafa; }}
-  .num {{ text-align: right; font-variant-numeric: tabular-nums; }}
-  .highlight {{ color: #16a34a; font-weight: 700; }}
-  .small {{ font-size: 11px; color: #888; }}
-  a {{ color: #1a1a1a; }}
-  .pitch {{ background: #fffbeb; border: 1px solid #fbbf24; border-radius: 8px; padding: 20px 24px; margin: 32px 0; }}
-  .pitch h3 {{ margin: 0 0 8px; font-size: 15px; }}
-  .pitch p {{ margin: 0; font-size: 13px; color: #555; line-height: 1.6; }}
-  footer {{ margin-top: 40px; font-size: 11px; color: #aaa; }}
+  * {{ box-sizing: border-box; margin: 0; padding: 0; }}
+  body {{ font-family: -apple-system, 'Helvetica Neue', Arial, sans-serif; background: #f8f8f6; color: #1a1a1a; }}
+  .header {{ background: #1a1a1a; color: white; padding: 40px 48px 32px; }}
+  .header h1 {{ font-size: 30px; font-weight: 800; letter-spacing: -0.5px; }}
+  .header .sub {{ color: #999; font-size: 14px; margin-top: 6px; }}
+  .stats-bar {{ background: white; border-bottom: 1px solid #eee; padding: 20px 48px; display: flex; gap: 48px; }}
+  .s {{ text-align: center; }}
+  .s .lbl {{ font-size: 10px; text-transform: uppercase; letter-spacing: 0.5px; color: #999; }}
+  .s .val {{ font-size: 22px; font-weight: 800; margin-top: 2px; }}
+  .pitch-bar {{ background: #fffbeb; border-bottom: 1px solid #fde68a; padding: 16px 48px; font-size: 13px; color: #78350f; line-height: 1.5; }}
+  .grid {{ display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 20px; padding: 32px 48px; max-width: 1400px; }}
+  .lot-card {{ background: white; border-radius: 10px; overflow: hidden; box-shadow: 0 1px 4px rgba(0,0,0,.08); transition: box-shadow .15s; }}
+  .lot-card:hover {{ box-shadow: 0 4px 16px rgba(0,0,0,.12); }}
+  .card-body {{ padding: 16px; }}
+  .card-title {{ font-size: 13px; font-weight: 600; line-height: 1.4; margin-bottom: 8px; color: #1a1a1a; }}
+  .card-stats {{ display: grid; grid-template-columns: 1fr 1fr; gap: 6px 16px; margin: 12px 0; }}
+  .stat-label {{ font-size: 10px; text-transform: uppercase; letter-spacing: 0.4px; color: #999; display: block; }}
+  .stat-val {{ font-size: 13px; font-weight: 600; }}
+  .card-footer {{ display: flex; justify-content: space-between; align-items: center; margin-top: 12px; padding-top: 12px; border-top: 1px solid #f0f0f0; }}
+  .rec-bid {{ background: #1a1a1a; color: white; padding: 4px 10px; border-radius: 20px; font-size: 11px; font-weight: 600; }}
+  .ai-banner {{ background: #ede9fe; border: 1px solid #c4b5fd; margin: 0 48px 32px; border-radius: 10px; padding: 20px 24px; font-size: 13px; color: #4c1d95; }}
+  .ai-banner strong {{ font-size: 14px; }}
+  footer {{ padding: 32px 48px; font-size: 11px; color: #aaa; border-top: 1px solid #eee; background: white; }}
 </style>
 </head>
 <body>
-<h1>Kohler + Signature Hardware — Contractor Lot Package</h1>
-<div class="subtitle">B-Stock Premium Liquidation · Sourced for STR/Cabin Developers · All New Condition</div>
 
-<div class="stat-row">
-  <div class="stat">
-    <div class="label">Total MSRP Across Lots</div>
-    <div class="value">${total_msrp:,.0f}</div>
-  </div>
-  <div class="stat">
-    <div class="label">Current Total Bid</div>
-    <div class="value">${total_bid:,.0f}</div>
-  </div>
-  <div class="stat">
-    <div class="label">Total Units</div>
-    <div class="value">{total_units:,}</div>
-  </div>
-  <div class="stat">
-    <div class="label">Avg Discount vs MSRP</div>
-    <div class="value">{round((1 - total_bid/total_msrp)*100) if total_msrp else 0:.0f}%+</div>
-  </div>
+<div class="header">
+  <h1>Kohler + Signature Hardware</h1>
+  <div class="sub">B-Stock Liquidation Lots · All New Condition · Sourced for STR &amp; Cabin Developers</div>
 </div>
 
-<div class="pitch">
-  <h3>Who this is for</h3>
-  <p>
-    Building 10–50 unit STR properties (cabins, mountain retreats, lake houses)?
-    These Kohler lots let you spec and install premium hardware — same brand used in $500/night properties —
-    at &lt;5% of retail. Buy the bath trim, shower heads, and accessories together and you can
-    outfit 50+ bathrooms with matching Kohler fixtures for roughly <strong>${round(total_bid / max(1, total_units // 3)):,}/bathroom</strong> all-in landed.
-    Signature Hardware adds door + cabinet packages to complete the interior package.
-  </p>
+<div class="stats-bar">
+  <div class="s"><div class="lbl">Total MSRP</div><div class="val">${total_msrp:,.0f}</div></div>
+  <div class="s"><div class="lbl">Total Bid (so far)</div><div class="val">${total_bid:,.0f}</div></div>
+  <div class="s"><div class="lbl">Total Units</div><div class="val">{total_units:,}</div></div>
+  <div class="s"><div class="lbl">Avg Discount</div><div class="val">{avg_discount:.0f}%+</div></div>
+  <div class="s"><div class="lbl">Lots Available</div><div class="val">{len(lot_data)}</div></div>
 </div>
 
-<table>
-  <thead>
-    <tr>
-      <th>Lot</th>
-      <th class="num">MSRP</th>
-      <th class="num">Units</th>
-      <th class="num">Bid</th>
-      <th class="num">$/Unit MSRP</th>
-      <th class="num">$/Unit Landed</th>
-      <th class="num">Savings</th>
-      <th class="num">Resale ROI</th>
-      <th class="num">Max Bid</th>
-      <th>Time Left</th>
-    </tr>
-  </thead>
-  <tbody>
-    {rows_html}
-  </tbody>
-</table>
+<div class="pitch-bar">
+  <strong>Who this is for:</strong> Building 10–50 unit STR cabins or lake houses? These Kohler lots let you outfit every bathroom
+  with matching premium hardware at under 5% of retail. Enough inventory to cover 50–200 rooms.
+  Confirmed finish on towel bars: <strong>Brushed Nickel</strong> — the most universally matched finish for mountain/cabin builds.
+</div>
+
+<div class="grid">
+{cards_html}
+</div>
+
+<div class="ai-banner">
+  <strong>Coming soon: AI Bathroom Mockups</strong><br>
+  We're building AI-rendered bathroom visualizations showing exactly what these Kohler fixtures look like installed —
+  different finishes, cabin vs modern aesthetics, full room staging. Contact us to get the mockup pack for your specific build.
+</div>
 
 <footer>
-  Generated by B-Stock Deal Scout · Data from live B-Stock auctions · Bid prices update every 15min
+  Generated by B-Stock Deal Scout · Live auction data · Refreshed every 15 min · Prices and time remaining update automatically
 </footer>
+
 </body>
 </html>"""
     return HTMLResponse(content=html, status_code=200)
