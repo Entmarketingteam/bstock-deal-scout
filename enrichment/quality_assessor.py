@@ -78,13 +78,28 @@ def _median(vals: list[float]) -> float | None:
 # ─── per-source lookups ─────────────────────────────────────────────────────
 
 def _search_ebay_sold(client: Any, item: dict) -> dict[str, Any]:
-    """Search eBay completed listings for sold prices."""
+    """Search eBay completed listings for sold prices.
+
+    Uses real eBay API if credentials available, otherwise Tavily search.
+    """
+    # Prefer real eBay API
+    try:
+        from enrichment.ebay_api import available as ebay_available, sold_comps
+        if ebay_available():
+            return sold_comps(item)
+    except ImportError:
+        pass
+
+    # Tavily fallback
+    if not client:
+        return {"ebay_sold_price": None, "ebay_sold_count": 0}
+
     upc = item.get("upc") or ""
     brand = item.get("brand") or ""
     desc = item.get("description") or ""
 
     if upc and len(upc) >= 8:
-        q = f'site:ebay.com/itm "{upc}" sold completed'
+        q = f'site:ebay.com "{upc}" sold completed'
     elif brand and desc:
         q = f'site:ebay.com "{brand} {desc}" sold completed listing price'
     else:
@@ -100,7 +115,6 @@ def _search_ebay_sold(client: Any, item: dict) -> dict[str, Any]:
             all_prices.extend(_extract_prices(r["answer"]))
 
         unit_retail = float(item.get("unit_retail") or 0)
-        # Filter: sold prices shouldn't be > 110% of retail (would be nonsense)
         if unit_retail > 0:
             all_prices = [p for p in all_prices if p <= unit_retail * 1.1 and p > 0]
 
@@ -113,7 +127,7 @@ def _search_ebay_sold(client: Any, item: dict) -> dict[str, Any]:
             "ebay_sold_count": len(all_prices),
         }
     except Exception as exc:
-        log.debug("eBay search error: %s", exc)
+        log.debug("eBay Tavily fallback error: %s", exc)
         return {"ebay_sold_price": None, "ebay_sold_count": 0}
 
 
