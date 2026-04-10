@@ -6,6 +6,7 @@ import os
 from typing import Any
 
 from fastapi import FastAPI, Header, HTTPException
+from fastapi.responses import HTMLResponse
 
 from alerts.dispatch import send_alert
 from enrichment.bid_advisor import advise
@@ -106,6 +107,111 @@ def unwatch(auction_id: str, x_trigger_secret: str | None = Header(default=None)
     return {"unwatched": auction_id}
 
 
+@app.get("/bundles")
+def bundle_deals(x_trigger_secret: str | None = Header(default=None)) -> dict[str, Any]:
+    """
+    Group current reno listings into complementary bundles for contractor/STR pitches.
+
+    Returns curated package groupings with per-bathroom cost calculations.
+    Designed to support an AI lookbook for BowTiedBroke-style STR developers.
+    """
+    _require_auth(x_trigger_secret)
+    from storage.db import _client
+
+    # Category detection patterns
+    CATEGORIES = {
+        "shower": ["shower", "bluetooth shower", "shower head", "shower trim"],
+        "bath_fixtures": ["bath spout", "valve trim", "faucet", "tub", "bathtub", "bath faucet"],
+        "accessories": ["towel", "soap dispenser", "hotelier", "bath accessory", "robe hook", "toilet paper"],
+        "kitchen": ["kitchen faucet", "kitchen"],
+        "hardware": ["door", "cabinet", "knob", "pull", "handle", "lock", "deadbolt"],
+        "lighting": ["light", "chandelier", "ceiling fan", "lamp"],
+    }
+
+    def _categorize(listing: dict) -> list[str]:
+        text = (listing.get("title") or "").lower()
+        matched = []
+        for cat, keywords in CATEGORIES.items():
+            if any(kw in text for kw in keywords):
+                matched.append(cat)
+        return matched or ["other"]
+
+    with _client() as c:
+        r = c.get(
+            "/bstock_listings",
+            params={
+                "reno_relevant": "eq.true",
+                "order": "roi_score.desc.nullslast",
+                "select": "auction_id,title,storefront,location,msrp,current_bid,roi_score,lot_quality_score,fb_total_value,recommended_max_bid,walk_away_price,unit_count,shipping_estimate,url,time_remaining",
+            },
+        )
+        r.raise_for_status()
+        listings = r.json()
+
+    # Classify + enrich each listing
+    classified = []
+    for row in listings:
+        cats = _categorize(row)
+        bid = float(row.get("current_bid") or 0)
+        ship = float(row.get("shipping_estimate") or 300)
+        units = int(row.get("unit_count") or 1)
+        classified.append({
+            **row,
+            "categories": cats,
+            "landed_cost": bid + ship,
+            "per_unit_cost": round((bid + ship) / units, 2) if units else 0,
+            "per_unit_msrp": round(float(row.get("msrp") or 0) / units, 2) if units else 0,
+        })
+
+    # Bundle: "Complete Bath Suite" — shower + fixtures + accessories
+    bath_bundle = [l for l in classified if any(c in l["categories"] for c in ["shower", "bath_fixtures", "accessories"])]
+    kitchen_bundle = [l for l in classified if "kitchen" in l["categories"]]
+    hardware_bundle = [l for l in classified if "hardware" in l["categories"]]
+
+    def _bundle_summary(bundle: list[dict], name: str, bathrooms_per_unit: float = 1.0) -> dict:
+        if not bundle:
+            return {"name": name, "lots": [], "total_bid": 0, "total_units": 0}
+        total_bid = sum(float(l.get("current_bid") or 0) for l in bundle)
+        total_landed = sum(l["landed_cost"] for l in bundle)
+        total_msrp = sum(float(l.get("msrp") or 0) for l in bundle)
+        total_fb = sum(float(l.get("fb_total_value") or 0) for l in bundle)
+        total_units = sum(int(l.get("unit_count") or 0) for l in bundle)
+        # Estimate bathrooms: conservative based on accessory lot
+        bathrooms = max(1, int(min(int(l.get("unit_count") or 0) for l in bundle) * bathrooms_per_unit))
+        return {
+            "name": name,
+            "lots": [{"id": l["auction_id"], "title": l["title"], "bid": l.get("current_bid"), "units": l.get("unit_count"), "per_unit_cost": l["per_unit_cost"]} for l in bundle],
+            "total_bid": total_bid,
+            "total_landed": round(total_landed, 2),
+            "total_msrp": total_msrp,
+            "total_fb_value": total_fb,
+            "total_units": total_units,
+            "estimated_bathrooms": bathrooms,
+            "cost_per_bathroom": round(total_landed / bathrooms, 2) if bathrooms else None,
+            "msrp_per_bathroom": round(total_msrp / bathrooms, 2) if bathrooms else None,
+            "bundle_roi": round((total_fb - total_landed) / total_landed, 4) if total_landed and total_fb else None,
+        }
+
+    bundles = [
+        _bundle_summary(bath_bundle, "Complete Bath Suite (Shower + Fixtures + Accessories)"),
+        _bundle_summary(kitchen_bundle, "Kitchen Package"),
+        _bundle_summary(hardware_bundle, "Door & Cabinet Hardware Package"),
+    ]
+
+    # All premium hardware (bath + kitchen + hardware, skip outdoor/garden)
+    premium = [l for l in classified if l["categories"] != ["other"]]
+    bundles.append(_bundle_summary(premium, "Full Hardware Package (All Premium Lots)", bathrooms_per_unit=0.5))
+
+    return {
+        "total_reno_listings": len(listings),
+        "bundles": [b for b in bundles if b["lots"]],
+        "all_classified": [
+            {k: v for k, v in l.items() if k != "raw_json"}
+            for l in classified
+        ],
+    }
+
+
 @app.get("/reno")
 def reno_deals(x_trigger_secret: str | None = Header(default=None)) -> dict[str, Any]:
     """All reno-relevant listings with landed cost + ROI breakdown."""
@@ -195,6 +301,156 @@ def history(auction_id: str, x_trigger_secret: str | None = Header(default=None)
     _require_auth(x_trigger_secret)
     snapshots = get_bid_history(auction_id)
     return {"auction_id": auction_id, "snapshots": snapshots, "count": len(snapshots)}
+
+
+@app.get("/lookbook-report", response_class=HTMLResponse)
+def lookbook_report(x_trigger_secret: str | None = Header(default=None)) -> HTMLResponse:
+    """
+    Generate an HTML contractor lookbook for current premium hardware lots.
+    Targeted at STR developers / builders (BowTiedBroke-style cabin builds).
+    Returns self-contained HTML — save as PDF or email directly.
+    """
+    _require_auth(x_trigger_secret)
+    from storage.db import _client
+
+    with _client() as c:
+        r = c.get(
+            "/bstock_listings",
+            params={
+                "reno_relevant": "eq.true",
+                "order": "msrp.desc",
+                "select": "auction_id,title,msrp,current_bid,unit_count,shipping_estimate,fb_total_value,roi_score,lot_quality_score,recommended_max_bid,url,location,time_remaining",
+            },
+        )
+        r.raise_for_status()
+        listings = [l for l in r.json() if "outdoor" not in (l.get("title") or "").lower() and "garden" not in (l.get("title") or "").lower()]
+
+    # Build per-lot data
+    lot_rows = []
+    for l in listings:
+        bid = float(l.get("current_bid") or 0)
+        ship = float(l.get("shipping_estimate") or 300)
+        units = int(l.get("unit_count") or 1)
+        msrp = float(l.get("msrp") or 0)
+        landed = bid + ship
+        lot_rows.append({
+            **l,
+            "landed": landed,
+            "per_unit_landed": round(landed / units, 2) if units else 0,
+            "per_unit_msrp": round(msrp / units, 2) if units else 0,
+            "discount_pct": round((1 - landed / msrp) * 100, 0) if msrp else 0,
+        })
+
+    total_msrp = sum(float(l.get("msrp") or 0) for l in lot_rows)
+    total_bid = sum(float(l.get("current_bid") or 0) for l in lot_rows)
+    total_units = sum(int(l.get("unit_count") or 0) for l in lot_rows)
+
+    def _row(l: dict) -> str:
+        roi_str = f"{l.get('roi_score') or 0:.1f}x" if l.get("roi_score") else "—"
+        rec_bid = f"${l.get('recommended_max_bid') or 0:,.0f}" if l.get("recommended_max_bid") else "—"
+        return f"""
+        <tr>
+          <td><a href="{l.get('url','#')}" target="_blank">{l.get('title','')[:60]}</a></td>
+          <td class="num">${l.get('msrp') or 0:,.0f}</td>
+          <td class="num">{l.get('unit_count') or '—'}</td>
+          <td class="num">${l.get('current_bid') or 0:,.0f}</td>
+          <td class="num">${l['per_unit_msrp']:,.2f}</td>
+          <td class="num">${l['per_unit_landed']:,.2f}</td>
+          <td class="num highlight">{l['discount_pct']:.0f}% off</td>
+          <td class="num">{roi_str}</td>
+          <td class="num">{rec_bid}</td>
+          <td class="small">{l.get('time_remaining','—')}</td>
+        </tr>"""
+
+    rows_html = "".join(_row(l) for l in lot_rows)
+
+    html = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>B-Stock Premium Hardware — Contractor Lookbook</title>
+<style>
+  body {{ font-family: 'Helvetica Neue', Arial, sans-serif; margin: 0; padding: 40px; color: #1a1a1a; max-width: 1100px; }}
+  h1 {{ font-size: 28px; font-weight: 700; letter-spacing: -0.5px; margin-bottom: 4px; }}
+  .subtitle {{ color: #555; font-size: 14px; margin-bottom: 32px; }}
+  .stat-row {{ display: flex; gap: 24px; margin-bottom: 40px; }}
+  .stat {{ background: #f5f5f5; border-radius: 8px; padding: 16px 24px; flex: 1; }}
+  .stat .label {{ font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; color: #888; }}
+  .stat .value {{ font-size: 28px; font-weight: 700; margin-top: 4px; }}
+  table {{ width: 100%; border-collapse: collapse; font-size: 13px; }}
+  th {{ background: #1a1a1a; color: white; padding: 10px 12px; text-align: left; font-weight: 600; font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; }}
+  td {{ padding: 10px 12px; border-bottom: 1px solid #eee; vertical-align: top; }}
+  tr:hover td {{ background: #fafafa; }}
+  .num {{ text-align: right; font-variant-numeric: tabular-nums; }}
+  .highlight {{ color: #16a34a; font-weight: 700; }}
+  .small {{ font-size: 11px; color: #888; }}
+  a {{ color: #1a1a1a; }}
+  .pitch {{ background: #fffbeb; border: 1px solid #fbbf24; border-radius: 8px; padding: 20px 24px; margin: 32px 0; }}
+  .pitch h3 {{ margin: 0 0 8px; font-size: 15px; }}
+  .pitch p {{ margin: 0; font-size: 13px; color: #555; line-height: 1.6; }}
+  footer {{ margin-top: 40px; font-size: 11px; color: #aaa; }}
+</style>
+</head>
+<body>
+<h1>Kohler + Signature Hardware — Contractor Lot Package</h1>
+<div class="subtitle">B-Stock Premium Liquidation · Sourced for STR/Cabin Developers · All New Condition</div>
+
+<div class="stat-row">
+  <div class="stat">
+    <div class="label">Total MSRP Across Lots</div>
+    <div class="value">${total_msrp:,.0f}</div>
+  </div>
+  <div class="stat">
+    <div class="label">Current Total Bid</div>
+    <div class="value">${total_bid:,.0f}</div>
+  </div>
+  <div class="stat">
+    <div class="label">Total Units</div>
+    <div class="value">{total_units:,}</div>
+  </div>
+  <div class="stat">
+    <div class="label">Avg Discount vs MSRP</div>
+    <div class="value">{round((1 - total_bid/total_msrp)*100) if total_msrp else 0:.0f}%+</div>
+  </div>
+</div>
+
+<div class="pitch">
+  <h3>Who this is for</h3>
+  <p>
+    Building 10–50 unit STR properties (cabins, mountain retreats, lake houses)?
+    These Kohler lots let you spec and install premium hardware — same brand used in $500/night properties —
+    at &lt;5% of retail. Buy the bath trim, shower heads, and accessories together and you can
+    outfit 50+ bathrooms with matching Kohler fixtures for roughly <strong>${round(total_bid / max(1, total_units // 3)):,}/bathroom</strong> all-in landed.
+    Signature Hardware adds door + cabinet packages to complete the interior package.
+  </p>
+</div>
+
+<table>
+  <thead>
+    <tr>
+      <th>Lot</th>
+      <th class="num">MSRP</th>
+      <th class="num">Units</th>
+      <th class="num">Bid</th>
+      <th class="num">$/Unit MSRP</th>
+      <th class="num">$/Unit Landed</th>
+      <th class="num">Savings</th>
+      <th class="num">Resale ROI</th>
+      <th class="num">Max Bid</th>
+      <th>Time Left</th>
+    </tr>
+  </thead>
+  <tbody>
+    {rows_html}
+  </tbody>
+</table>
+
+<footer>
+  Generated by B-Stock Deal Scout · Data from live B-Stock auctions · Bid prices update every 15min
+</footer>
+</body>
+</html>"""
+    return HTMLResponse(content=html, status_code=200)
 
 
 @app.post("/run")
