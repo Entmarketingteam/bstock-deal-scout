@@ -612,14 +612,11 @@ def lookbook_report() -> HTMLResponse:  # noqa: C901
         if mockup_html:
             mockup_html = f'<div class="mockup-row">{mockup_html}</div>'
 
-        # Product cards for this lot
+        # Product cards for this lot — skip entirely if no manifest items
         items = items_by_lot.get(aid, [])
+        if not items:
+            return ""
         prod_cards = "".join(_product_card(it) for it in items)
-        if not prod_cards:
-            # Fallback: show the lot-level image if no manifest items
-            fallback_img = l.get("image_url") or ""
-            fallback_html = f'<img src="{fallback_img}" style="height:120px;object-fit:contain;margin:16px auto;display:block" loading="lazy">' if fallback_img else ""
-            prod_cards = f'<div class="no-manifest">{fallback_html}<p>Individual product details loading — check back after next enrichment run.</p></div>'
 
         return f"""
       <div class="lot-section">
