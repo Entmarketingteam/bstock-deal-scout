@@ -237,3 +237,28 @@ def get_unalerted_qualifying(min_msrp: float = 2000) -> list[dict[str, Any]]:
         )
         r.raise_for_status()
         return r.json()
+
+
+def add_resale(auction_id: str, buy_price: float, sell_price: float,
+               sell_channel: str, days_to_sell: int | None, notes: str) -> dict:
+    with _client() as c:
+        r = c.post("/bstock_resales", json={
+            "auction_id": auction_id,
+            "buy_price": buy_price,
+            "sell_price": sell_price,
+            "sell_channel": sell_channel,
+            "days_to_sell": days_to_sell,
+            "notes": notes,
+        })
+        r.raise_for_status()
+        return r.json()[0] if r.json() else {}
+
+
+def get_resales() -> list[dict]:
+    with _client() as c:
+        r = c.get("/bstock_resales", params={
+            "order": "created_at.desc",
+            "select": "id,auction_id,buy_price,sell_price,sell_channel,days_to_sell,notes,created_at",
+        })
+        r.raise_for_status()
+        return r.json()

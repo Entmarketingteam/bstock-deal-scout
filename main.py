@@ -19,8 +19,10 @@ from scraper.bstock import scrape_listings
 from scraper.manifest import fetch_and_parse
 from scraper.fetch_listing import fetch_listing
 from storage.db import (
+    add_resale,
     add_to_watchlist,
     get_bid_history,
+    get_resales,
     get_unalerted_qualifying,
     get_watchlist,
     insert_manifest_items,
@@ -794,6 +796,68 @@ def lookbook_report() -> HTMLResponse:  # noqa: C901
 </body>
 </html>"""
     return HTMLResponse(content=html, status_code=200)
+
+
+@app.get("/dashboard", response_class=HTMLResponse)
+def dashboard(secret: str | None = None) -> HTMLResponse:
+    """Analytics dashboard — requires ?secret=TRIGGER_SECRET in URL."""
+    trigger_secret = os.getenv("TRIGGER_SECRET", "")
+    if not secret or secret != trigger_secret:
+        return HTMLResponse(
+            '<html><body style="background:#0f0f0f;color:#e8e8e8;font-family:sans-serif;padding:48px;text-align:center">'
+            '<h2>Access denied</h2><p style="color:#666;margin-top:8px">Append ?secret=YOUR_TRIGGER_SECRET to the URL</p>'
+            '</body></html>',
+            status_code=403,
+        )
+    from dashboard import render_dashboard
+    from storage.db import _client
+    # Fetch all listings
+    with _client() as c:
+        r = c.get("/bstock_listings", params={
+            "order": "created_at.desc",
+            "select": "auction_id,title,storefront,msrp,current_bid,unit_count,lot_quality_score,recommended_max_bid,walk_away_price,has_manifest,shipping_estimate,time_remaining,condition,location,url,verdict",
+            "limit": "500",
+        })
+        listings = r.json() if r.status_code == 200 else []
+    # Fetch bid history for all lots
+    history_map: dict[str, list] = {}
+    if listings:
+        aids_q = ",".join(f'"{l["auction_id"]}"' for l in listings)
+        with _client() as c:
+            r = c.get("/bstock_bid_history", params={
+                "auction_id": f"in.({aids_q})",
+                "order": "snapped_at.asc",
+                "select": "auction_id,snapped_at,current_bid,bid_count",
+            })
+            for row in (r.json() if r.status_code == 200 else []):
+                history_map.setdefault(row["auction_id"], []).append(row)
+    resales = get_resales()
+    html = render_dashboard(listings, history_map, resales, secret)
+    return HTMLResponse(content=html, status_code=200)
+
+
+@app.post("/log-sale")
+def log_sale(
+    payload: dict[str, Any],
+    x_trigger_secret: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """Record an actual resale outcome. Body: auction_id, buy_price, sell_price, sell_channel, days_to_sell, notes."""
+    _require_auth(x_trigger_secret)
+    required = ["auction_id", "buy_price", "sell_price"]
+    for field in required:
+        if field not in payload:
+            raise HTTPException(status_code=422, detail=f"Missing field: {field}")
+    result = add_resale(
+        auction_id=payload["auction_id"],
+        buy_price=float(payload["buy_price"]),
+        sell_price=float(payload["sell_price"]),
+        sell_channel=payload.get("sell_channel", ""),
+        days_to_sell=payload.get("days_to_sell"),
+        notes=payload.get("notes", ""),
+    )
+    profit = float(payload["sell_price"]) - float(payload["buy_price"])
+    roi = round((profit / float(payload["buy_price"])) * 100, 1) if float(payload["buy_price"]) else 0
+    return {"ok": True, "profit": round(profit, 2), "roi_pct": roi, **result}
 
 
 @app.post("/run")
