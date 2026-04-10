@@ -126,6 +126,20 @@ def insert_manifest_items(auction_id: str, items: list[dict[str, Any]]) -> None:
                 "fb_price": it.get("fb_price"),
                 "fb_source": it.get("fb_source"),
                 "fb_searched_at": it.get("fb_searched_at"),
+                "quality_score": it.get("quality_score"),
+                "quality_notes": it.get("quality_notes"),
+                "ebay_sold_price": it.get("ebay_sold_price"),
+                "ebay_sold_count": it.get("ebay_sold_count"),
+                "ebay_low": it.get("ebay_low"),
+                "ebay_high": it.get("ebay_high"),
+                "ebay_active_low": it.get("ebay_active_low"),
+                "ebay_price_source": it.get("ebay_price_source"),
+                "hd_price": it.get("hd_price"),
+                "hd_url": it.get("hd_url"),
+                "lowes_price": it.get("lowes_price"),
+                "lowes_url": it.get("lowes_url"),
+                "mfr_price": it.get("mfr_price"),
+                "mfr_url": it.get("mfr_url"),
             })
         r = c.post("/bstock_manifest_items", json=rows)
         if r.status_code >= 400:

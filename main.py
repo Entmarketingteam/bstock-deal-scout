@@ -256,19 +256,23 @@ def run(x_trigger_secret: str | None = Header(default=None)) -> dict[str, Any]:
 
                 manifest_url = (detail or {}).get("manifest_doc_url")
                 with _db_client() as c:
-                    c.patch(
+                    patch_payload = {
+                        "has_manifest": bool(manifest_url),
+                        "fb_total_value": advice["total_fb_value"],
+                        "roi_score": roi,
+                        "lot_quality_score": advice["lot_quality_score"],
+                        "recommended_max_bid": advice["recommended_max_bid"],
+                        "walk_away_price": advice["walk_away_price"],
+                        "top_items": advice["top_items"],
+                    }
+                    if manifest_url:
+                        patch_payload["manifest_doc_url"] = manifest_url
+                    pr = c.patch(
                         f"/bstock_listings?auction_id=eq.{aid}",
-                        json={
-                            "has_manifest": bool(manifest_url),
-                            **({"manifest_doc_url": manifest_url} if manifest_url else {}),
-                            "fb_total_value": advice["total_fb_value"],
-                            "roi_score": roi,
-                            "lot_quality_score": advice["lot_quality_score"],
-                            "recommended_max_bid": advice["recommended_max_bid"],
-                            "walk_away_price": advice["walk_away_price"],
-                            "top_items": advice["top_items"],
-                        },
+                        json=patch_payload,
                     )
+                    if pr.status_code >= 400:
+                        log.error("Listings PATCH failed for %s: %s %s", aid, pr.status_code, pr.text[:300])
                 log.info(
                     "Reno assessed %s: quality=%.1f fb_total=$%,.0f rec_bid=$%,.0f verdict=%s",
                     aid, advice["lot_quality_score"], advice["total_fb_value"],
