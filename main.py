@@ -303,6 +303,180 @@ def history(auction_id: str, x_trigger_secret: str | None = Header(default=None)
     return {"auction_id": auction_id, "snapshots": snapshots, "count": len(snapshots)}
 
 
+def _dalle_prompt(title: str, finish: str) -> str:
+    """Build DALL-E 3 prompt for a cabin bathroom mockup based on lot title + finish."""
+    title_low = title.lower()
+    finish_desc = {
+        "Brushed Nickel": "brushed nickel",
+        "Matte Black": "matte black",
+        "Polished Chrome": "polished chrome",
+    }.get(finish, "brushed nickel")
+
+    if any(kw in title_low for kw in ["towel", "hotelier", "robe", "accessory", "accessories"]):
+        product_desc = f"{finish_desc} towel bars, towel rings, and bathroom accessories mounted on wall"
+    elif any(kw in title_low for kw in ["shower head", "shower trim", "shower", "bluetooth shower"]):
+        product_desc = f"{finish_desc} rainfall shower head and trim kit"
+    elif any(kw in title_low for kw in ["kitchen faucet", "kitchen"]):
+        product_desc = f"{finish_desc} kitchen faucet over farmhouse sink"
+    elif any(kw in title_low for kw in ["bath spout", "valve trim", "tub", "faucet"]):
+        product_desc = f"{finish_desc} tub filler faucet and bath hardware"
+    else:
+        product_desc = f"{finish_desc} bathroom hardware and fixtures"
+
+    return (
+        f"Professional interior design photograph of a luxury mountain cabin bathroom. "
+        f"Warm cedar wood walls, natural stone tile floor, frameless glass shower. "
+        f"Featured hardware: {product_desc}. "
+        f"Warm ambient lighting, cozy rustic-modern aesthetic. "
+        f"Photorealistic, 4K, architectural digest style. No people, no text."
+    )
+
+
+def _ensure_storage_bucket() -> bool:
+    """Create bstock-mockups public storage bucket if it doesn't exist."""
+    import httpx as _httpx
+    supabase_url = os.environ.get("SUPABASE_URL", "").rstrip("/")
+    key = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "")
+    headers = {"apikey": key, "Authorization": f"Bearer {key}"}
+    with _httpx.Client(base_url=supabase_url, headers=headers, timeout=15) as sc:
+        r = sc.get("/storage/v1/bucket/bstock-mockups")
+        if r.status_code == 200:
+            return True
+        r2 = sc.post("/storage/v1/bucket", json={"id": "bstock-mockups", "name": "bstock-mockups", "public": True})
+        return r2.status_code in (200, 201)
+
+
+def _generate_and_store_mockup(auction_id: str, title: str, finish: str, openai_key: str) -> str | None:
+    """Generate one DALL-E 3 mockup, upload to Supabase Storage, return permanent URL."""
+    import httpx as _httpx
+
+    supabase_url = os.environ.get("SUPABASE_URL", "").rstrip("/")
+    key = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "")
+    storage_headers = {"apikey": key, "Authorization": f"Bearer {key}"}
+
+    prompt = _dalle_prompt(title, finish)
+
+    with _httpx.Client(timeout=90) as c:
+        r = c.post(
+            "https://api.openai.com/v1/images/generations",
+            headers={"Authorization": f"Bearer {openai_key}", "Content-Type": "application/json"},
+            json={"model": "dall-e-3", "prompt": prompt, "n": 1, "size": "1024x1024",
+                  "quality": "standard", "response_format": "url"},
+        )
+        if r.status_code != 200:
+            log.error("DALL-E 3 error for %s %s: %s", auction_id, finish, r.text[:300])
+            return None
+
+        img_url = r.json()["data"][0]["url"]
+        img_r = c.get(img_url)
+        if img_r.status_code != 200:
+            log.error("Failed to download DALL-E image for %s %s", auction_id, finish)
+            return None
+        img_bytes = img_r.content
+
+    finish_slug = finish.lower().replace(" ", "-").replace("/", "-")
+    path = f"{auction_id}/{finish_slug}.png"
+
+    with _httpx.Client(base_url=supabase_url, timeout=30) as sc:
+        ru = sc.post(
+            f"/storage/v1/object/bstock-mockups/{path}",
+            content=img_bytes,
+            headers={**storage_headers, "Content-Type": "image/png", "x-upsert": "true"},
+        )
+        if ru.status_code not in (200, 201):
+            log.error("Storage upload failed for %s: %s %s", path, ru.status_code, ru.text[:200])
+            return None
+
+    return f"{supabase_url}/storage/v1/object/public/bstock-mockups/{path}"
+
+
+@app.post("/generate-mockups")
+def generate_mockups(  # noqa: C901
+    auction_ids: list[str] | None = None,
+    finishes: list[str] | None = None,
+    x_trigger_secret: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """
+    Generate AI cabin-bathroom mockups via DALL-E 3 for reno-relevant lots.
+    Downloads each image and uploads to Supabase Storage for permanent hosting.
+    URLs are saved to bstock_listings.ai_mockup_url (JSONB).
+
+    - auction_ids: specific lots (default: all reno-relevant with quality >= 5)
+    - finishes: list of finish names (default: ["Brushed Nickel", "Matte Black"])
+    """
+    _require_auth(x_trigger_secret)
+
+    openai_key = os.environ.get("OPENAI_API_KEY")
+    if not openai_key:
+        raise HTTPException(status_code=500, detail="OPENAI_API_KEY not configured")
+
+    _ensure_storage_bucket()
+    finishes = finishes or ["Brushed Nickel", "Matte Black"]
+
+    from storage.db import _client
+    with _client() as c:
+        params: dict[str, Any] = {
+            "reno_relevant": "eq.true",
+            "select": "auction_id,title,lot_quality_score,ai_mockup_url",
+        }
+        if auction_ids:
+            ids_q = ",".join(f'"{i}"' for i in auction_ids)
+            params["auction_id"] = f"in.({ids_q})"
+        else:
+            params["lot_quality_score"] = "gte.5"
+        r = c.get("/bstock_listings", params=params)
+        r.raise_for_status()
+        lots = r.json()
+
+    if not lots:
+        return {"generated": 0, "message": "No qualifying lots found"}
+
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    def _process_lot(lot: dict) -> dict:
+        aid = lot["auction_id"]
+        title = lot.get("title") or ""
+        existing = lot.get("ai_mockup_url") or {}
+        urls = dict(existing) if isinstance(existing, dict) else {}
+        generated: list[str] = []
+
+        for finish in finishes:
+            finish_key = finish.lower().replace(" ", "_").replace("/", "_")
+            if urls.get(finish_key):
+                continue
+            url = _generate_and_store_mockup(aid, title, finish, openai_key)
+            if url:
+                urls[finish_key] = url
+                generated.append(finish)
+                log.info("Generated mockup %s %s → %s", aid, finish, url)
+
+        if generated:
+            from storage.db import _client as _c2
+            with _c2() as c:
+                c.patch(f"/bstock_listings?auction_id=eq.{aid}", json={"ai_mockup_url": urls})
+
+        return {"auction_id": aid, "title": title[:50], "generated": generated, "urls": urls}
+
+    results = []
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        futures = {pool.submit(_process_lot, lot): lot for lot in lots}
+        for fut in as_completed(futures):
+            try:
+                results.append(fut.result())
+            except Exception as e:
+                lot = futures[fut]
+                log.error("Mockup gen failed for %s: %s", lot.get("auction_id"), e)
+                results.append({"auction_id": lot.get("auction_id"), "error": str(e)})
+
+    total_gen = sum(len(r.get("generated", [])) for r in results)
+    return {
+        "lots_processed": len(results),
+        "images_generated": total_gen,
+        "cost_estimate_usd": round(total_gen * 0.04, 2),
+        "results": results,
+    }
+
+
 @app.get("/lookbook-report", response_class=HTMLResponse)
 def lookbook_report(x_trigger_secret: str | None = Header(default=None)) -> HTMLResponse:  # noqa: C901
     """
@@ -320,7 +494,7 @@ def lookbook_report(x_trigger_secret: str | None = Header(default=None)) -> HTML
             params={
                 "reno_relevant": "eq.true",
                 "order": "roi_score.desc.nullslast",
-                "select": "auction_id,title,msrp,current_bid,unit_count,shipping_estimate,fb_total_value,roi_score,lot_quality_score,recommended_max_bid,walk_away_price,url,location,time_remaining,image_url",
+                "select": "auction_id,title,msrp,current_bid,unit_count,shipping_estimate,fb_total_value,roi_score,lot_quality_score,recommended_max_bid,walk_away_price,url,location,time_remaining,image_url,ai_mockup_url",
             },
         )
         r.raise_for_status()
@@ -373,6 +547,14 @@ def lookbook_report(x_trigger_secret: str | None = Header(default=None)) -> HTML
         elif "signature hardware" in title_low:
             finish = "Multiple finishes"
 
+        mockup_urls = l.get("ai_mockup_url") or {}
+        if isinstance(mockup_urls, str):
+            import json as _json
+            try:
+                mockup_urls = _json.loads(mockup_urls)
+            except Exception:
+                mockup_urls = {}
+
         lot_data.append({
             **l,
             "landed": landed,
@@ -382,6 +564,7 @@ def lookbook_report(x_trigger_secret: str | None = Header(default=None)) -> HTML
             "product_img": product_img or fallback_img,
             "product_link": product_link or l.get("url", "#"),
             "finish": finish,
+            "mockup_urls": mockup_urls,
         })
 
     total_msrp = sum(float(l.get("msrp") or 0) for l in lot_data)
@@ -439,6 +622,44 @@ def lookbook_report(x_trigger_secret: str | None = Header(default=None)) -> HTML
 
     cards_html = "".join(_lot_card(l) for l in lot_data)
 
+    # Build AI renders section
+    FINISH_LABELS = {
+        "brushed_nickel": "Brushed Nickel",
+        "matte_black": "Matte Black",
+        "polished_chrome": "Polished Chrome",
+    }
+    ai_cards = []
+    for l in lot_data:
+        mockups = l.get("mockup_urls") or {}
+        short_title = (l.get("title") or "")[:45]
+        for key, label in FINISH_LABELS.items():
+            url = mockups.get(key)
+            if url:
+                ai_cards.append(f"""
+        <div class="ai-card">
+          <img src="{url}" alt="AI render: {short_title} — {label}" loading="lazy"
+               onerror="this.parentElement.style.display='none'">
+          <div class="ai-card-body">
+            <div class="ai-card-label">{label}</div>
+            <div class="ai-card-sub">{short_title}</div>
+          </div>
+        </div>""")
+
+    if ai_cards:
+        ai_section_html = f"""<div class="ai-section">
+  <h2>AI Bathroom Visualizations</h2>
+  <div class="ai-sub">DALL-E 3 renders showing these fixtures installed in a mountain cabin bathroom</div>
+  <div class="ai-grid">{''.join(ai_cards)}</div>
+</div>"""
+    else:
+        ai_section_html = """<div class="ai-section">
+  <div class="ai-cta">
+    <strong>AI Bathroom Mockups — coming soon</strong><br>
+    Hit <code>POST /generate-mockups</code> to generate DALL-E 3 renders of these fixtures in a cabin bathroom.
+    ~$0.08 per lot, results cached permanently. Takes ~60 seconds.
+  </div>
+</div>"""
+
     html = f"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -466,8 +687,16 @@ def lookbook_report(x_trigger_secret: str | None = Header(default=None)) -> HTML
   .stat-val {{ font-size: 13px; font-weight: 600; }}
   .card-footer {{ display: flex; justify-content: space-between; align-items: center; margin-top: 12px; padding-top: 12px; border-top: 1px solid #f0f0f0; }}
   .rec-bid {{ background: #1a1a1a; color: white; padding: 4px 10px; border-radius: 20px; font-size: 11px; font-weight: 600; }}
-  .ai-banner {{ background: #ede9fe; border: 1px solid #c4b5fd; margin: 0 48px 32px; border-radius: 10px; padding: 20px 24px; font-size: 13px; color: #4c1d95; }}
-  .ai-banner strong {{ font-size: 14px; }}
+  .ai-section {{ padding: 0 48px 40px; }}
+  .ai-section h2 {{ font-size: 20px; font-weight: 800; margin-bottom: 6px; }}
+  .ai-section .ai-sub {{ font-size: 12px; color: #888; margin-bottom: 20px; }}
+  .ai-grid {{ display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 16px; }}
+  .ai-card {{ background: white; border-radius: 10px; overflow: hidden; box-shadow: 0 1px 4px rgba(0,0,0,.08); }}
+  .ai-card img {{ width: 100%; height: 220px; object-fit: cover; display: block; }}
+  .ai-card-body {{ padding: 12px 14px; }}
+  .ai-card-label {{ font-size: 12px; font-weight: 700; color: #1a1a1a; }}
+  .ai-card-sub {{ font-size: 11px; color: #888; margin-top: 2px; }}
+  .ai-cta {{ background: #ede9fe; border: 1px solid #c4b5fd; border-radius: 10px; padding: 20px 24px; margin-top: 20px; font-size: 13px; color: #4c1d95; }}
   footer {{ padding: 32px 48px; font-size: 11px; color: #aaa; border-top: 1px solid #eee; background: white; }}
 </style>
 </head>
@@ -496,11 +725,7 @@ def lookbook_report(x_trigger_secret: str | None = Header(default=None)) -> HTML
 {cards_html}
 </div>
 
-<div class="ai-banner">
-  <strong>Coming soon: AI Bathroom Mockups</strong><br>
-  We're building AI-rendered bathroom visualizations showing exactly what these Kohler fixtures look like installed —
-  different finishes, cabin vs modern aesthetics, full room staging. Contact us to get the mockup pack for your specific build.
-</div>
+{ai_section_html}
 
 <footer>
   Generated by B-Stock Deal Scout · Live auction data · Refreshed every 15 min · Prices and time remaining update automatically
