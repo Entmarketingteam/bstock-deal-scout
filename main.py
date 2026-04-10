@@ -117,7 +117,7 @@ def reno_deals(x_trigger_secret: str | None = Header(default=None)) -> dict[str,
             params={
                 "reno_relevant": "eq.true",
                 "order": "roi_score.desc.nullslast",
-                "select": "auction_id,title,storefront,location,msrp,current_bid,pct_of_msrp,price_label,time_remaining,has_manifest,shipping_estimate,fb_total_value,roi_score,unit_count,url",
+                "select": "auction_id,title,storefront,location,msrp,current_bid,pct_of_msrp,price_label,time_remaining,has_manifest,shipping_estimate,fb_total_value,roi_score,unit_count,url,lot_quality_score,recommended_max_bid,walk_away_price,top_items",
             },
         )
         r.raise_for_status()
