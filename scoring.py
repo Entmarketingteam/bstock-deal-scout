@@ -37,6 +37,10 @@ def _is_target_brand(listing: dict[str, Any]) -> bool:
 
 
 def qualifies_for_alert(listing: dict[str, Any]) -> bool:
+    # Never alert on lots without a real manifest — we can't verify what we're buying
+    if not listing.get("manifest_doc_url"):
+        return False
+
     listing_type = listing.get("listing_type")
     msrp = listing.get("msrp") or 0
     price_label = listing.get("price_label")

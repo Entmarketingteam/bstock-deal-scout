@@ -222,6 +222,7 @@ def reno_deals(x_trigger_secret: str | None = Header(default=None)) -> dict[str,
             "/bstock_listings",
             params={
                 "reno_relevant": "eq.true",
+                "has_manifest": "eq.true",
                 "order": "roi_score.desc.nullslast",
                 "select": "auction_id,title,storefront,location,msrp,current_bid,pct_of_msrp,price_label,time_remaining,has_manifest,shipping_estimate,fb_total_value,roi_score,unit_count,url,lot_quality_score,recommended_max_bid,walk_away_price,top_items",
             },
@@ -819,14 +820,12 @@ def run(x_trigger_secret: str | None = Header(default=None)) -> dict[str, Any]:
             aid = reno_listing["auction_id"]
             detail = fetch_listing(aid)
 
-            raw_items = []
-            if detail and detail.get("manifest_doc_url"):
-                raw_items = fetch_and_parse(detail["manifest_doc_url"])
+            # Only process lots with a real manifest doc — no synthetic fallback
+            if not detail or not detail.get("manifest_doc_url"):
+                log.debug("No manifest doc for %s — skipping enrichment", aid)
+                continue
 
-            # Fallback: synthesize manifest items from listing title + unit count
-            # Used when no CSV manifest exists (e.g. Kohler brand lots)
-            if not raw_items:
-                raw_items = _synthetic_items(reno_listing)
+            raw_items = fetch_and_parse(detail["manifest_doc_url"])
 
             if raw_items:
                 enriched = enrich_manifest(raw_items)
