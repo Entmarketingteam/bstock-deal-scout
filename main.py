@@ -531,9 +531,11 @@ def scout_page() -> HTMLResponse:
     from datetime import datetime, timezone
 
     sf_filter = ",".join(f'"{s}"' for s in TARGET_STOREFRONTS)
+    now_iso = datetime.now(timezone.utc).isoformat()
     with _client() as c:
         r = c.get("/bstock_listings", params={
             "storefront": f"in.({sf_filter})",
+            "time_remaining": f"gt.{now_iso}",
             "order": "time_remaining.asc.nullslast",
             "select": "auction_id,title,storefront,msrp,current_bid,unit_count,lot_quality_score,recommended_max_bid,walk_away_price,time_remaining,condition,location,url,image_url,reno_relevant,has_manifest",
             "limit": "200",
