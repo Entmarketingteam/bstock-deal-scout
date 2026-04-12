@@ -307,6 +307,49 @@ def history(auction_id: str, x_trigger_secret: str | None = Header(default=None)
     return {"auction_id": auction_id, "snapshots": snapshots, "count": len(snapshots)}
 
 
+# ── lookbook helpers (module-level so they're not recreated per request) ──────
+
+def _condition_pill(cond: str) -> str:
+    words = set(cond.lower().split())
+    if "new" in words or "overstock" in words:
+        return f'<span class="pill green">✅ {cond or "New"}</span>'
+    if "salvage" in words:
+        return f'<span class="pill" style="background:#fee2e2;color:#dc2626">⚠️ Salvage</span>'
+    if "return" in words or "returns" in words:
+        return f'<span class="pill" style="background:#fef9c3;color:#92400e">↩ {cond or "Returns"}</span>'
+    return ""
+
+
+def _time_info(time_val: str) -> tuple[str, str]:
+    from datetime import datetime, timezone
+    try:
+        end_dt = datetime.fromisoformat(time_val.replace("Z", "+00:00"))
+        diff = end_dt - datetime.now(timezone.utc)
+        if diff.total_seconds() <= 0:
+            return "ENDED", "#dc2626"
+        h = int(diff.total_seconds() // 3600)
+        m = int((diff.total_seconds() % 3600) // 60)
+        color = "#dc2626" if h < 4 else ("#ca8a04" if h < 12 else "#16a34a")
+        return f"{h}h {m}m", color
+    except Exception:
+        return time_val[:16] if time_val else "—", "#888"
+
+
+def _finish_badge(text: str) -> str:
+    t = text.lower()
+    if "brushed nickel" in t or "-bn" in t:
+        finish, color = "Brushed Nickel", "#7c6f5a"
+    elif "matte black" in t or "-bl" in t:
+        finish, color = "Matte Black", "#222"
+    elif "polished chrome" in t or "-cp" in t:
+        finish, color = "Polished Chrome", "#5a7c8a"
+    elif "multiple" in t or "various" in t:
+        finish, color = "Multiple Finishes", "#6b8f6b"
+    else:
+        return ""
+    return f'<span class="finish-badge" style="background:{color}">{finish}</span>'
+
+
 def _dalle_prompt(title: str, finish: str) -> str:
     """Build DALL-E 3 prompt for a cabin bathroom mockup based on lot title + finish."""
     title_low = title.lower()
@@ -489,7 +532,6 @@ def lookbook_report() -> HTMLResponse:  # noqa: C901
     Intentionally public — designed to be shared with buyers/contractors.
     """
     from storage.db import _client
-    from datetime import datetime, timezone
 
     SKIP_KEYWORDS = ("outdoor", "garden", "power equipment")
 
@@ -519,43 +561,6 @@ def lookbook_report() -> HTMLResponse:  # noqa: C901
             for it in (mr.json() if mr.status_code == 200 else []):
                 items_by_lot.setdefault(it["auction_id"], []).append(it)
 
-    # ── helpers ──────────────────────────────────────────────────────────────
-    def _condition_pill(cond: str) -> str:
-        c = cond.lower()
-        if "new" in c or "overstock" in c:
-            return f'<span class="pill green">✅ {cond or "New"}</span>'
-        if "salvage" in c:
-            return f'<span class="pill" style="background:#fee2e2;color:#dc2626">⚠️ Salvage</span>'
-        if "return" in c:
-            return f'<span class="pill" style="background:#fef9c3;color:#92400e">↩ {cond or "Returns"}</span>'
-        return ""
-
-    def _time_info(time_val: str) -> tuple[str, str]:
-        try:
-            end_dt = datetime.fromisoformat(time_val.replace("Z", "+00:00"))
-            diff = end_dt - datetime.now(timezone.utc)
-            if diff.total_seconds() <= 0:
-                return "ENDED", "#dc2626"
-            h = int(diff.total_seconds() // 3600)
-            m = int((diff.total_seconds() % 3600) // 60)
-            color = "#dc2626" if h < 4 else ("#ca8a04" if h < 12 else "#16a34a")
-            return f"{h}h {m}m", color
-        except Exception:
-            return time_val[:16] if time_val else "—", "#888"
-
-    def _finish_badge(text: str) -> str:
-        t = text.lower()
-        if "brushed nickel" in t or "-bn" in t:
-            finish, color = "Brushed Nickel", "#7c6f5a"
-        elif "matte black" in t or "-bl" in t:
-            finish, color = "Matte Black", "#222"
-        elif "polished chrome" in t or "-cp" in t:
-            finish, color = "Polished Chrome", "#5a7c8a"
-        elif "multiple" in t or "various" in t:
-            finish, color = "Multiple Finishes", "#6b8f6b"
-        else:
-            return ""
-        return f'<span class="finish-badge" style="background:{color}">{finish}</span>'
 
     def _retailer_links(it: dict) -> str:
         links = []
