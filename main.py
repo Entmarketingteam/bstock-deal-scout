@@ -524,6 +524,125 @@ def generate_mockups(  # noqa: C901
     }
 
 
+@app.get("/scout", response_class=HTMLResponse)
+def scout_page() -> HTMLResponse:
+    """Mobile-friendly public deal board — shareable, no auth required."""
+    from storage.db import _client
+    from datetime import datetime, timezone
+
+    with _client() as c:
+        r = c.get("/bstock_listings", params={
+            "order": "time_remaining.asc.nullslast",
+            "select": "auction_id,title,storefront,msrp,current_bid,unit_count,lot_quality_score,recommended_max_bid,walk_away_price,time_remaining,condition,location,url,image_url,reno_relevant,has_manifest",
+            "limit": "200",
+        })
+        listings = r.json() if r.status_code == 200 else []
+
+    def _card(l: dict) -> str:
+        title = (l.get("title") or "Untitled")[:70]
+        msrp = float(l.get("msrp") or 0)
+        bid = float(l.get("current_bid") or 0)
+        units = int(l.get("unit_count") or 1)
+        score = l.get("lot_quality_score")
+        rec_bid = l.get("recommended_max_bid")
+        walk = l.get("walk_away_price")
+        condition = l.get("condition") or ""
+        location = l.get("location") or "—"
+        url = l.get("url") or "#"
+        img = l.get("image_url") or ""
+        time_str, time_color = _time_info(l.get("time_remaining") or "")
+
+        pct = round((bid / msrp) * 100, 0) if msrp else None
+        discount_str = f"{100 - pct:.0f}% below MSRP" if pct else ""
+
+        score_html = ""
+        if score is not None:
+            sc = float(score)
+            sc_color = "#16a34a" if sc >= 7 else ("#ca8a04" if sc >= 4 else "#dc2626")
+            score_html = f'<span class="badge" style="background:{sc_color}">Score {sc:.1f}/10</span>'
+
+        rec_html = ""
+        if rec_bid:
+            rec_html = f'<div class="rec">Bid up to <strong>${float(rec_bid):,.0f}</strong>'
+            if walk:
+                rec_html += f' · Walk away at <strong>${float(walk):,.0f}</strong>'
+            rec_html += '</div>'
+
+        cond_pill = _condition_pill(condition)
+        img_html = f'<img src="{img}" class="card-img" loading="lazy" onerror="this.style.display=\'none\'">' if img else ""
+
+        return f"""
+    <div class="card">
+      {img_html}
+      <div class="card-body">
+        <div class="card-title">{title}</div>
+        <div class="card-meta">
+          <span class="badge grey">{l.get("storefront") or "B-Stock"}</span>
+          {score_html}
+          {cond_pill}
+        </div>
+        <div class="card-stats">
+          <div class="stat"><label>Current Bid</label><value>${bid:,.0f}</value></div>
+          <div class="stat"><label>MSRP</label><value>${msrp:,.0f}</value></div>
+          <div class="stat"><label>Units</label><value>{units}</value></div>
+          <div class="stat"><label>Location</label><value>{location}</value></div>
+        </div>
+        {f'<div class="discount">{discount_str}</div>' if discount_str else ""}
+        {rec_html}
+        <div class="card-footer">
+          <span class="time" style="color:{time_color}">⏱ {time_str}</span>
+          <a href="{url}" target="_blank" class="btn">View on B-Stock →</a>
+        </div>
+      </div>
+    </div>"""
+
+    cards_html = "".join(_card(l) for l in listings)
+    count = len(listings)
+    now = datetime.now(timezone.utc).strftime("%b %d, %Y %H:%M UTC")
+
+    html = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>B-Stock Deal Scout</title>
+  <style>
+    *{{box-sizing:border-box;margin:0;padding:0}}
+    body{{background:#0f0f0f;color:#e8e8e8;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;padding:16px}}
+    h1{{font-size:1.4rem;font-weight:700;margin-bottom:4px}}
+    .sub{{color:#888;font-size:.85rem;margin-bottom:20px}}
+    .grid{{display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:16px}}
+    .card{{background:#1a1a1a;border:1px solid #2a2a2a;border-radius:12px;overflow:hidden}}
+    .card-img{{width:100%;height:160px;object-fit:cover;background:#111}}
+    .card-body{{padding:14px}}
+    .card-title{{font-size:.95rem;font-weight:600;line-height:1.3;margin-bottom:10px}}
+    .card-meta{{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:12px}}
+    .badge{{font-size:.72rem;font-weight:600;padding:3px 8px;border-radius:20px;color:#fff}}
+    .badge.grey{{background:#333;color:#ccc}}
+    .pill{{font-size:.72rem;font-weight:600;padding:3px 8px;border-radius:20px;background:#333;color:#ccc}}
+    .pill.green{{background:#14532d;color:#86efac}}
+    .card-stats{{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:10px}}
+    .stat{{background:#111;border-radius:8px;padding:8px 10px}}
+    .stat label{{display:block;font-size:.7rem;color:#888;text-transform:uppercase;letter-spacing:.04em;margin-bottom:2px}}
+    .stat value{{font-size:.95rem;font-weight:600}}
+    .discount{{font-size:.8rem;color:#86efac;margin-bottom:8px;font-weight:500}}
+    .rec{{font-size:.8rem;color:#fcd34d;background:#1c1800;border:1px solid #3d3000;border-radius:6px;padding:7px 10px;margin-bottom:10px}}
+    .card-footer{{display:flex;align-items:center;justify-content:space-between;margin-top:10px}}
+    .time{{font-size:.8rem;font-weight:500}}
+    .btn{{background:#2563eb;color:#fff;font-size:.8rem;font-weight:600;padding:7px 14px;border-radius:8px;text-decoration:none;white-space:nowrap}}
+    .empty{{text-align:center;color:#555;padding:60px 20px;font-size:.95rem}}
+    @media(max-width:400px){{.card-stats{{grid-template-columns:1fr 1fr}}.btn{{font-size:.75rem;padding:6px 10px}}}}
+  </style>
+</head>
+<body>
+  <h1>B-Stock Deal Scout</h1>
+  <p class="sub">{count} lots tracked · Updated {now}</p>
+  {'<div class="grid">' + cards_html + '</div>' if listings else '<div class="empty">No lots tracked yet. Run /run to scrape.</div>'}
+</body>
+</html>"""
+    return HTMLResponse(content=html, status_code=200)
+
+
 @app.get("/lookbook-report", response_class=HTMLResponse)
 def lookbook_report() -> HTMLResponse:  # noqa: C901
     """
