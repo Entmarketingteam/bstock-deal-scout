@@ -268,6 +268,12 @@ tr:hover td{{background:#161616}}
       <option value="yes">Has manifest</option>
       <option value="no">No manifest</option>
     </select>
+    <select id="lots-filter-condition" onchange="filterTable('lots')">
+      <option value="">All conditions</option>
+      <option value="new">New / Overstock</option>
+      <option value="returns">Customer Returns</option>
+      <option value="salvage">Salvage</option>
+    </select>
     <select id="lots-sort" onchange="sortTable('lots')">
       <option value="quality_desc">Quality ↓</option>
       <option value="discount_desc">Discount % ↓</option>
@@ -282,6 +288,7 @@ tr:hover td{{background:#161616}}
       <thead><tr>
         <th>Title</th>
         <th>Storefront</th>
+        <th>Condition</th>
         <th>MSRP</th>
         <th>Current Bid</th>
         <th>B-Stock Fee</th>
@@ -493,7 +500,7 @@ function fmt(n, prefix='$') {{
 function renderLotsTable() {{
   const tbody = document.getElementById('lots-tbody');
   if (!filteredLots.length) {{
-    tbody.innerHTML = '<tr><td colspan="14" class="empty-state">No active lots found</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="15" class="empty-state">No active lots found</td></tr>';
     document.getElementById('lots-count').textContent = '0 lots';
     return;
   }}
@@ -509,11 +516,20 @@ function renderLotsTable() {{
     const discount = msrp ? Math.round((1 - total/msrp)*100) : 0;
     const qs = parseFloat(l.lot_quality_score||0);
     const rec = l.recommended_max_bid;
+    const cond = (l.condition||'').toLowerCase();
+    const condBadge = cond.includes('new')||cond.includes('overstock')
+      ? '<span class="pill pill-green">New</span>'
+      : cond.includes('salvage')
+      ? '<span class="pill pill-red">Salvage</span>'
+      : cond.includes('return')
+      ? '<span class="pill pill-yellow">Returns</span>'
+      : '<span style="color:#666">—</span>';
     return `<tr>
-      <td style="max-width:260px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${{l.title||''}}">
+      <td style="max-width:240px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${{l.title||''}}">
         ${{l.title ? l.title.slice(0,55) + (l.title.length>55?'…':'') : '—'}}
       </td>
       <td style="white-space:nowrap;color:#888">${{l.storefront||'—'}}</td>
+      <td>${{condBadge}}</td>
       <td>${{fmt(l.msrp)}}</td>
       <td style="font-weight:700">${{fmt(l.current_bid)}}</td>
       <td style="color:#888">${{fmt(fee)}}</td>
@@ -562,10 +578,17 @@ function filterTable(which) {{
   if (which === 'lots') {{
     const q = document.getElementById('lots-search').value.toLowerCase();
     const mf = document.getElementById('lots-filter-manifest').value;
+    const cf = document.getElementById('lots-filter-condition').value;
     filteredLots = active.filter(l => {{
       const matchQ = !q || (l.title||'').toLowerCase().includes(q) || (l.storefront||'').toLowerCase().includes(q);
       const matchM = !mf || (mf==='yes' ? l.has_manifest : !l.has_manifest);
-      return matchQ && matchM;
+      const cond = (l.condition||'').toLowerCase();
+      const matchC = !cf || (
+        cf==='new' ? (cond.includes('new') || cond.includes('overstock')) :
+        cf==='returns' ? cond.includes('return') :
+        cf==='salvage' ? cond.includes('salvage') : true
+      );
+      return matchQ && matchM && matchC;
     }});
     sortTable('lots');
   }} else {{

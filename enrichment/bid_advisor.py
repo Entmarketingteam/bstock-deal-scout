@@ -45,6 +45,21 @@ def advise(
         dict with: recommended_max_bid, walk_away_price, lot_quality_score,
                    top_items, summary, per_item_breakdown
     """
+    # ── Condition-aware margin targets ───────────────────────────────────────
+    lot_condition = (listing.get("condition") or listing.get("inventoryType") or "").lower()
+    if "salvage" in lot_condition:
+        effective_conservative = 0.65  # 65% margin for salvage — huge uncertainty
+        effective_walk_away = 0.50
+        condition_note = "Salvage margins applied (65%/50%)"
+    elif "return" in lot_condition:
+        effective_conservative = 0.55  # 55% for returns — unknown mix
+        effective_walk_away = 0.42
+        condition_note = "Returns margins applied (55%/42%)"
+    else:
+        effective_conservative = CONSERVATIVE_MARGIN
+        effective_walk_away = WALK_AWAY_MARGIN
+        condition_note = ""
+
     # ── Aggregate resale value ───────────────────────────────────────────────
     total_fb_value = 0.0
     total_items = 0
@@ -69,7 +84,7 @@ def advise(
             quality_weighted_sum += q_score * retail * qty
             quality_weight_total += retail * qty
 
-        bid_contribution = round(item_fb_total * CONSERVATIVE_MARGIN, 2)
+        bid_contribution = round(item_fb_total * effective_conservative, 2)
         item_rows.append({
             "brand": brand,
             "description": desc[:60],
@@ -92,9 +107,9 @@ def advise(
         else 3.0
     )
 
-    # Bid recommendations
-    recommended_max_bid = max(0, round(total_fb_value * (1 - CONSERVATIVE_MARGIN) - shipping, 0))
-    walk_away_price = max(0, round(total_fb_value * (1 - WALK_AWAY_MARGIN) - shipping, 0))
+    # Bid recommendations (condition-adjusted margins)
+    recommended_max_bid = max(0, round(total_fb_value * (1 - effective_conservative) - shipping, 0))
+    walk_away_price = max(0, round(total_fb_value * (1 - effective_walk_away) - shipping, 0))
 
     current_bid = float(listing.get("current_bid") or 0)
     landed_at_current = current_bid + shipping
@@ -118,13 +133,14 @@ def advise(
 
     summary_lines = [
         f"Lot: {listing.get('title', '')[:70]}",
+        f"Condition: {lot_condition.title() or 'Unknown'}" + (f" [{condition_note}]" if condition_note else ""),
         f"Items: {total_items} units across {len(items)} SKUs",
         f"Est. resale value: ${total_fb_value:,.0f} | MSRP: ${msrp:,.0f}",
         f"Shipping estimate: ${shipping:,.0f}",
         f"",
         f"VERDICT: {verdict}",
-        f"  Recommended max bid: ${recommended_max_bid:,.0f}  (50% gross margin)",
-        f"  Walk-away ceiling:   ${walk_away_price:,.0f}  (35% gross margin)",
+        f"  Recommended max bid: ${recommended_max_bid:,.0f}  ({effective_conservative*100:.0f}% gross margin)",
+        f"  Walk-away ceiling:   ${walk_away_price:,.0f}  ({effective_walk_away*100:.0f}% gross margin)",
         f"  Current bid:         ${current_bid:,.0f}  → landed ${landed_at_current:,.0f}",
         f"  Margin at current:   {margin_at_current:.1f}%",
         f"",

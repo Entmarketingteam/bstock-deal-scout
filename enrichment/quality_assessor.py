@@ -260,13 +260,26 @@ def _quality_score(item: dict) -> tuple[float, str]:
         score += 1.0
         notes.append(f"Mfr MSRP ${mfr:,.0f}")
 
-    # Condition bonus
+    # Condition adjustment — stronger penalties for non-new lots
     if "overstock" in condition or "new" in condition:
         score += 0.5
-        notes.append("New/Overstock")
-    elif "salvage" in condition or "return" in condition:
-        score -= 1.0
-        notes.append("Returns/Salvage ↓")
+        notes.append("New/Overstock ✓")
+    elif "salvage" in condition:
+        score -= 3.0
+        notes.append("Salvage — expect heavy damage ↓↓↓")
+    elif "return" in condition:
+        if "grade a" in condition:
+            score -= 1.5
+            notes.append("Returns Grade A ↓")
+        elif "grade b" in condition:
+            score -= 2.5
+            notes.append("Returns Grade B — mixed quality ↓↓")
+        elif "grade c" in condition:
+            score -= 3.0
+            notes.append("Returns Grade C — heavy damage likely ↓↓↓")
+        else:
+            score -= 2.0
+            notes.append("Customer Returns ↓↓")
 
     # Retail price vs eBay ratio — big discount means high quality deal
     if ebay and unit_retail > 0:
@@ -327,12 +340,26 @@ def assess_items(
         item["quality_score"] = score
         item["quality_notes"] = notes
 
-        # Best available resale price (ebay_sold > hd×0.7 > lowes×0.7 > retail×0.15)
+        # Best available resale price — adjusted for condition
+        # New/Overstock: sell at 65% of retail comp; Returns: 50%; Salvage: 35%
+        cond = (item.get("condition") or "").lower()
+        if "salvage" in cond:
+            hd_mult, retail_mult = 0.40, 0.10
+        elif "return" in cond:
+            if "grade a" in cond:
+                hd_mult, retail_mult = 0.55, 0.13
+            elif "grade b" in cond or "grade c" in cond:
+                hd_mult, retail_mult = 0.45, 0.10
+            else:
+                hd_mult, retail_mult = 0.50, 0.12
+        else:
+            hd_mult, retail_mult = 0.65, 0.15
+
         resale = (
             item.get("ebay_sold_price")
-            or (item.get("hd_price") and item["hd_price"] * 0.65)
-            or (item.get("lowes_price") and item["lowes_price"] * 0.65)
-            or float(item.get("unit_retail") or 0) * 0.15
+            or (item.get("hd_price") and item["hd_price"] * hd_mult)
+            or (item.get("lowes_price") and item["lowes_price"] * hd_mult)
+            or float(item.get("unit_retail") or 0) * retail_mult
         )
         item["fb_price"] = round(resale, 2) if resale else None
 

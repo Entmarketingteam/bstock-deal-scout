@@ -520,6 +520,16 @@ def lookbook_report() -> HTMLResponse:  # noqa: C901
                 items_by_lot.setdefault(it["auction_id"], []).append(it)
 
     # ── helpers ──────────────────────────────────────────────────────────────
+    def _condition_pill(cond: str) -> str:
+        c = cond.lower()
+        if "new" in c or "overstock" in c:
+            return f'<span class="pill green">✅ {cond or "New"}</span>'
+        if "salvage" in c:
+            return f'<span class="pill" style="background:#fee2e2;color:#dc2626">⚠️ Salvage</span>'
+        if "return" in c:
+            return f'<span class="pill" style="background:#fef9c3;color:#92400e">↩ {cond or "Returns"}</span>'
+        return ""
+
     def _time_info(time_val: str) -> tuple[str, str]:
         try:
             end_dt = datetime.fromisoformat(time_val.replace("Z", "+00:00"))
@@ -635,6 +645,7 @@ def lookbook_report() -> HTMLResponse:  # noqa: C901
               <span class="pill">💵 MSRP ${msrp:,.0f}</span>
               <span class="pill green">🏷 {discount:.0f}% below MSRP</span>
               <span class="pill">📍 {l.get('location') or '—'}</span>
+              {_condition_pill(l.get('condition') or '')}
             </div>
           </div>
           <div class="lot-header-right">

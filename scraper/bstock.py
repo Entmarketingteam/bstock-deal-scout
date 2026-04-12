@@ -32,8 +32,9 @@ BSTOCK_EMAIL = os.getenv("BSTOCK_EMAIL", "marketingteam@nickient.com")
 BSTOCK_PASSWORD = os.getenv("BSTOCK_PASSWORD", "")
 
 # ── Listings endpoint ─────────────────────────────────────────────────────────
-# RSC URL for all-auctions with condition=New filter
-LISTINGS_RSC_URL = "https://bstock.com/all-auctions?condition=%5B%22New%22%5D&offset={offset}&_rsc=rsc1"
+# Base RSC URL — condition filter injected dynamically by scrape_listings()
+# B-Stock condition values: "New", "Used", "Salvage"
+LISTINGS_RSC_BASE = "https://bstock.com/all-auctions?{condition_qs}&offset={offset}&_rsc=rsc1"
 
 BROWSER_UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -104,9 +105,9 @@ def get_jwt_token() -> str:
     return _cached_token
 
 
-def _fetch_rsc_page(token: str, offset: int = 0) -> str:
+def _fetch_rsc_page(token: str, offset: int = 0, condition_qs: str = "condition=%5B%22New%22%5D") -> str:
     """Fetch one RSC page and return decompressed body text."""
-    url = LISTINGS_RSC_URL.format(offset=offset)
+    url = LISTINGS_RSC_BASE.format(condition_qs=condition_qs, offset=offset)
     resp = httpx.get(
         url,
         headers={
@@ -252,20 +253,33 @@ def _listing_from_rsc_obj(obj: dict) -> Listing | None:
     )
 
 
-def scrape_listings(condition: str = "New") -> list[Listing]:
-    """Scrape all active B-Stock listings for a given condition.
+def scrape_listings(conditions: list[str] | None = None) -> list[Listing]:
+    """Scrape all active B-Stock listings for the given condition(s).
 
-    Uses FusionAuth JWT + RSC API — no browser, no Cloudflare issues.
+    conditions: list of B-Stock condition strings, e.g. ["New"], ["New", "Used"].
+    Defaults to SCRAPE_CONDITIONS env var, or ["New"] if not set.
+
+    B-Stock condition values: "New", "Used", "Salvage"
     """
+    import os, urllib.parse
+    if conditions is None:
+        raw = os.getenv("SCRAPE_CONDITIONS", "New")
+        conditions = [c.strip() for c in raw.split(",") if c.strip()]
+
+    # Build condition query string: condition=%5B%22New%22%2C%22Used%22%5D
+    import json as _json
+    condition_qs = "condition=" + urllib.parse.quote(_json.dumps(conditions))
+
     token = get_jwt_token()
     results: list[Listing] = []
     seen_ids: set[str] = set()
     offset = 0
 
+    log.info("Scraping conditions: %s", conditions)
     while True:
         log.info("Fetching RSC page offset=%d", offset)
         try:
-            body = _fetch_rsc_page(token, offset=offset)
+            body = _fetch_rsc_page(token, offset=offset, condition_qs=condition_qs)
         except Exception as exc:
             log.error("RSC fetch failed at offset=%d: %s", offset, exc)
             break
