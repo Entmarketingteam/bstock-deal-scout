@@ -186,6 +186,12 @@ def _listing_from_rsc_obj(obj: dict) -> Listing | None:
     url = f"https://bstock.com/buy/listings/details/{listing_id}"
 
     msrp = obj.get("retailPrice")
+    # Fallback: parse "Ext. Retail $XX,XXX" from title if retailPrice is missing
+    if not msrp:
+        import re as _re
+        _m = _re.search(r'Ext\.\s*Retail\s*\$([0-9,]+)', obj.get("title") or "")
+        if _m:
+            msrp = float(_m.group(1).replace(",", ""))
     pct = obj.get("percentMsrp")
     current_bid: float | None = None
     pct_of_msrp: float | None = None

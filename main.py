@@ -530,17 +530,51 @@ def scout_page() -> HTMLResponse:
     from storage.db import _client
     from datetime import datetime, timezone
 
+    import re as _re
+
+    def _product_key(title: str) -> str:
+        """Normalize title to a product-type key for relist detection."""
+        t = (title or "").lower()
+        # Strip leading count/pallet info, location, ext retail
+        t = _re.sub(r'^\d+\s+pallets?\s+of\s+', '', t)
+        t = _re.sub(r'\bfrom\s+\w[\w ]+\s+of\s+', '', t)
+        t = _re.sub(r',.*$', '', t)  # everything after first comma
+        return t.strip()
+
     sf_filter = ",".join(f'"{s}"' for s in TARGET_STOREFRONTS)
     now_iso = datetime.now(timezone.utc).isoformat()
     with _client() as c:
+        # Active lots to display
         r = c.get("/bstock_listings", params={
             "storefront": f"in.({sf_filter})",
             "time_remaining": f"gt.{now_iso}",
             "order": "time_remaining.asc.nullslast",
-            "select": "auction_id,title,storefront,msrp,current_bid,unit_count,lot_quality_score,recommended_max_bid,walk_away_price,time_remaining,condition,location,url,image_url,reno_relevant,has_manifest",
+            "select": "auction_id,title,storefront,msrp,current_bid,unit_count,lot_quality_score,recommended_max_bid,walk_away_price,time_remaining,condition,location,url,image_url",
             "limit": "200",
         })
         listings = r.json() if r.status_code == 200 else []
+
+        # Ended lots — used to detect relists and show prior final bids
+        r2 = c.get("/bstock_listings", params={
+            "storefront": f"in.({sf_filter})",
+            "time_remaining": f"lt.{now_iso}",
+            "select": "auction_id,title,current_bid,msrp,time_remaining",
+            "order": "time_remaining.desc.nullslast",
+            "limit": "200",
+        })
+        ended = r2.json() if r2.status_code == 200 else []
+
+    # Build relist index: product_key -> list of (auction_id, final_bid, end_date)
+    relist_map: dict[str, list] = {}
+    for e in ended:
+        key = _product_key(e.get("title", ""))
+        if key:
+            relist_map.setdefault(key, []).append({
+                "id": e["auction_id"],
+                "bid": float(e.get("current_bid") or 0),
+                "msrp": float(e.get("msrp") or 0),
+                "ended": (e.get("time_remaining") or "")[:10],
+            })
 
     def _card(l: dict) -> str:
         title = (l.get("title") or "Untitled")[:70]
@@ -575,6 +609,14 @@ def scout_page() -> HTMLResponse:
         cond_pill = _condition_pill(condition)
         img_html = f'<img src="{img}" class="card-img" loading="lazy" onerror="this.style.display=\'none\'">' if img else ""
 
+        # Relist detection
+        pkey = _product_key(l.get("title", ""))
+        prior = relist_map.get(pkey, [])
+        relist_html = ""
+        if prior:
+            prior_bids = " · ".join(f'${p["bid"]:,.0f} ({p["ended"]})' for p in prior[:3])
+            relist_html = f'<div class="relist">🔁 Relisted — prior bids: {prior_bids}</div>'
+
         return f"""
     <div class="card">
       {img_html}
@@ -587,11 +629,12 @@ def scout_page() -> HTMLResponse:
         </div>
         <div class="card-stats">
           <div class="stat"><label>Current Bid</label><value>${bid:,.0f}</value></div>
-          <div class="stat"><label>MSRP</label><value>${msrp:,.0f}</value></div>
+          <div class="stat"><label>Ext. Retail</label><value>${msrp:,.0f}</value></div>
           <div class="stat"><label>Units</label><value>{units}</value></div>
           <div class="stat"><label>Location</label><value>{location}</value></div>
         </div>
         {f'<div class="discount">{discount_str}</div>' if discount_str else ""}
+        {relist_html}
         {rec_html}
         <div class="card-footer">
           <span class="time" style="color:{time_color}">⏱ {time_str}</span>
@@ -631,6 +674,7 @@ def scout_page() -> HTMLResponse:
     .stat value{{font-size:.95rem;font-weight:600}}
     .discount{{font-size:.8rem;color:#86efac;margin-bottom:8px;font-weight:500}}
     .rec{{font-size:.8rem;color:#fcd34d;background:#1c1800;border:1px solid #3d3000;border-radius:6px;padding:7px 10px;margin-bottom:10px}}
+    .relist{{font-size:.8rem;color:#a78bfa;background:#1e1030;border:1px solid #4c1d95;border-radius:6px;padding:7px 10px;margin-bottom:10px}}
     .card-footer{{display:flex;align-items:center;justify-content:space-between;margin-top:10px}}
     .time{{font-size:.8rem;font-weight:500}}
     .btn{{background:#2563eb;color:#fff;font-size:.8rem;font-weight:600;padding:7px 14px;border-radius:8px;text-decoration:none;white-space:nowrap}}
