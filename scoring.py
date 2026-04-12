@@ -18,14 +18,22 @@ RENO_KEYWORDS = [
 HIGH_PRIORITY_PCT = 5.0
 HIGH_PRIORITY_MSRP = 10_000
 
+# Exact B-Stock storefront names to track — only these get scraped + shown
+TARGET_STOREFRONTS = ["Kohler", "Ferguson", "Winston Water Cooler"]
+TARGET_STOREFRONTS_LOWER = {s.lower() for s in TARGET_STOREFRONTS}
+
 # Brands/storefronts to watch closely — alert on "Good Price" too, lower MSRP floor
 TARGET_BRANDS = [
     "kohler",
     "winston",
-    "weston",
+    "ferguson",
 ]
 TARGET_BRAND_MIN_MSRP = 500
 TARGET_BRAND_LABELS = {"Great Price", "Good Price"}
+
+
+def is_target_storefront(listing: dict[str, Any]) -> bool:
+    return (listing.get("storefront") or "").lower() in TARGET_STOREFRONTS_LOWER
 
 
 def _is_target_brand(listing: dict[str, Any]) -> bool:

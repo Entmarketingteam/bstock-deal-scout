@@ -14,7 +14,7 @@ from enrichment.quality_assessor import assess_items
 from enrichment.resale_lookup import enrich_manifest_with_resale
 from enrichment.shipping import estimate_shipping, landed_cost
 from enrichment.tavily_lookup import enrich_manifest
-from scoring import has_manifest, is_reno_relevant, qualifies_for_alert, tier
+from scoring import has_manifest, is_reno_relevant, is_target_storefront, qualifies_for_alert, tier, TARGET_STOREFRONTS
 from scraper.bstock import scrape_listings
 from scraper.manifest import fetch_and_parse
 from scraper.fetch_listing import fetch_listing
@@ -530,8 +530,10 @@ def scout_page() -> HTMLResponse:
     from storage.db import _client
     from datetime import datetime, timezone
 
+    sf_filter = ",".join(f'"{s}"' for s in TARGET_STOREFRONTS)
     with _client() as c:
         r = c.get("/bstock_listings", params={
+            "storefront": f"in.({sf_filter})",
             "order": "time_remaining.asc.nullslast",
             "select": "auction_id,title,storefront,msrp,current_bid,unit_count,lot_quality_score,recommended_max_bid,walk_away_price,time_remaining,condition,location,url,image_url,reno_relevant,has_manifest",
             "limit": "200",
@@ -1001,8 +1003,9 @@ def run(x_trigger_secret: str | None = Header(default=None)) -> dict[str, Any]:
     log.info("=== Deal scout run start ===")
 
     # 1. Scrape
-    listings = [l.to_dict() for l in scrape_listings()]
-    log.info("Scraped %d listings", len(listings))
+    all_scraped = [l.to_dict() for l in scrape_listings()]
+    listings = [l for l in all_scraped if is_target_storefront(l)]
+    log.info("Scraped %d total, %d from target storefronts %s", len(all_scraped), len(listings), TARGET_STOREFRONTS)
 
     # 2. Annotate listings with shipping estimate + reno relevance
     for l in listings:
@@ -1012,14 +1015,10 @@ def run(x_trigger_secret: str | None = Header(default=None)) -> dict[str, Any]:
     # 3. Upsert + identify new
     new_ids = upsert_listings(listings) if listings else set()
 
-    # 3b. Auto-watchlist ALL lots from target storefronts — we want final bid data on every one
-    #     regardless of quality score or manifest status
-    WATCH_STOREFRONTS = ("winston", "kohler", "signature hardware")
+    # 3b. Auto-watchlist ALL target storefront lots — we want final bid data on every one
     for l in listings:
-        sf = (l.get("storefront") or "").lower()
-        if any(ws in sf for ws in WATCH_STOREFRONTS):
-            add_to_watchlist(l["auction_id"], reason=f"auto: target storefront ({l.get('storefront','')})")
-            log.info("Auto-watchlisted %s from %s", l["auction_id"], l.get("storefront"))
+        add_to_watchlist(l["auction_id"], reason=f"auto: target storefront ({l.get('storefront','')})")
+        log.info("Auto-watchlisted %s from %s", l["auction_id"], l.get("storefront"))
 
     # 4. Proactively fetch manifests for ALL new listings (not just reno_relevant)
     #    — any lot with a real manifest gets full quality/ROI analysis
