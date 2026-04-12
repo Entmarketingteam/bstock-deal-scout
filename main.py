@@ -830,8 +830,8 @@ def dashboard(secret: str | None = None) -> HTMLResponse:
     # Fetch all listings
     with _client() as c:
         r = c.get("/bstock_listings", params={
-            "order": "created_at.desc",
-            "select": "auction_id,title,storefront,msrp,current_bid,unit_count,lot_quality_score,recommended_max_bid,walk_away_price,has_manifest,shipping_estimate,time_remaining,condition,location,url,verdict",
+            "order": "first_seen.desc",
+            "select": "auction_id,title,storefront,msrp,current_bid,unit_count,lot_quality_score,recommended_max_bid,walk_away_price,has_manifest,shipping_estimate,time_remaining,condition,location,url,reno_relevant",
             "limit": "500",
         })
         listings = r.json() if r.status_code == 200 else []
