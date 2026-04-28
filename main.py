@@ -5,7 +5,7 @@ import logging
 import os
 from typing import Any
 
-from fastapi import FastAPI, Header, HTTPException
+from fastapi import BackgroundTasks, FastAPI, Header, HTTPException
 from fastapi.responses import HTMLResponse
 
 from alerts.dispatch import send_alert
@@ -1043,9 +1043,8 @@ def log_sale(
     return {"ok": True, "profit": round(profit, 2), "roi_pct": roi, **result}
 
 
-@app.post("/run")
-def run(x_trigger_secret: str | None = Header(default=None)) -> dict[str, Any]:
-    _require_auth(x_trigger_secret)
+def _run_scout() -> None:
+    """Full scrape + alert cycle. Extracted so /run can return immediately."""
     log.info("=== Deal scout run start ===")
 
     # 1. Scrape
@@ -1236,10 +1235,11 @@ def run(x_trigger_secret: str | None = Header(default=None)) -> dict[str, Any]:
 
     log.info("=== Run complete: %d scraped, %d new, %d alerted, %d watchlist snapped ===",
              len(listings), len(new_ids), alerts_sent, snapped)
-    return {
-        "scraped": len(listings),
-        "new": len(new_ids),
-        "qualifying": len(qualifying),
-        "alerts_sent": alerts_sent,
-        "watchlist_snapped": snapped,
-    }
+
+
+@app.post("/run")
+def run(background_tasks: BackgroundTasks, x_trigger_secret: str | None = Header(default=None)) -> dict[str, str]:
+    """Trigger a scout run. Returns immediately; work runs in background."""
+    _require_auth(x_trigger_secret)
+    background_tasks.add_task(_run_scout)
+    return {"status": "started"}
