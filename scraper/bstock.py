@@ -1,14 +1,14 @@
-"""B-Stock API scraper — no browser, no Cloudflare issues.
+"""B-Stock API scraper.
 
 Flow:
   1. POST auth.bstock.com/api/login → FusionAuth JWT (no OAuth UI, no browser)
   2. GET bstock.com/all-auctions RSC with JWT as cookie → listing JSON embedded in RSC
-  3. Parse listings from RSC JSON array, paginate via offset param
-  4. Return structured Listing objects with all deal data
+     (primary path — blocked by Cloudflare if Railway IP is flagged)
+  3. FALLBACK: If RSC returns 403 (Cloudflare), load known auction IDs from Supabase
+     and refresh each via /buy/listings/details/{id} which bypasses CF.
 
-Why this works: FusionAuth's /api/login endpoint doesn't go through the OAuth UI
-(which shows a white screen) and doesn't hit Cloudflare on bstock.com. The RSC
-endpoint passes Cloudflare silently because we have a valid JWT in the cookie.
+The /buy/listings/details/{id} endpoint is NOT protected by Cloudflare interactive
+challenges — confirmed in production logs. It serves as the CF-bypass fallback.
 """
 from __future__ import annotations
 
@@ -259,33 +259,26 @@ def _listing_from_rsc_obj(obj: dict) -> Listing | None:
     )
 
 
-def scrape_listings(conditions: list[str] | None = None) -> list[Listing]:
-    """Scrape all active B-Stock listings for the given condition(s).
-
-    conditions: list of B-Stock condition strings, e.g. ["New"], ["New", "Used"].
-    Defaults to SCRAPE_CONDITIONS env var, or ["New"] if not set.
-
-    B-Stock condition values: "New", "Used", "Salvage"
-    """
-    import os, urllib.parse
-    if conditions is None:
-        raw = os.getenv("SCRAPE_CONDITIONS", "New")
-        conditions = [c.strip() for c in raw.split(",") if c.strip()]
-
-    # Build condition query string: condition=%5B%22New%22%2C%22Used%22%5D
+def _scrape_via_rsc(token: str, conditions: list[str]) -> list[Listing]:
+    """Primary scrape path: /all-auctions RSC endpoint. Returns empty list on CF 403."""
+    import urllib.parse as _ulp
     import json as _json
-    condition_qs = "condition=" + urllib.parse.quote(_json.dumps(conditions))
 
-    token = get_jwt_token()
+    condition_qs = "condition=" + _ulp.quote(_json.dumps(conditions))
     results: list[Listing] = []
     seen_ids: set[str] = set()
     offset = 0
 
-    log.info("Scraping conditions: %s", conditions)
     while True:
         log.info("Fetching RSC page offset=%d", offset)
         try:
             body = _fetch_rsc_page(token, offset=offset, condition_qs=condition_qs)
+        except RuntimeError as exc:
+            if "403" in str(exc):
+                log.warning("RSC endpoint returned 403 (Cloudflare block) — will use DB fallback")
+            else:
+                log.error("RSC fetch failed at offset=%d: %s", offset, exc)
+            break
         except Exception as exc:
             log.error("RSC fetch failed at offset=%d: %s", offset, exc)
             break
@@ -305,6 +298,117 @@ def scrape_listings(conditions: list[str] | None = None) -> list[Listing]:
         offset += len(page_listings)
         if offset >= total or not page_listings:
             break
+
+    return results
+
+
+def _scrape_via_db_fallback(token: str) -> list[Listing]:
+    """CF-bypass fallback: reload known auction IDs from Supabase, refresh each via
+    /buy/listings/details/{id} which is NOT Cloudflare-protected.
+
+    This keeps the service operational when Railway's IP is CF-blocked on /all-auctions.
+    """
+    import os as _os
+
+    supabase_url = _os.environ.get("SUPABASE_URL", "").rstrip("/")
+    svc_key = _os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "")
+    if not supabase_url or not svc_key:
+        log.error("Supabase env vars missing — cannot run DB fallback")
+        return []
+
+    log.info("RSC blocked — loading active auction IDs from Supabase for DB fallback")
+
+    from datetime import datetime, timezone, timedelta
+    now_iso = datetime.now(timezone.utc).isoformat()
+    # Only reload lots that haven't ended yet (time_remaining > now)
+    # Also include recently ended lots (within 2 days) in case timing is off
+    cutoff_iso = (datetime.now(timezone.utc) - timedelta(days=2)).isoformat()
+
+    try:
+        r = httpx.get(
+            f"{supabase_url}/rest/v1/bstock_listings",
+            params={
+                "time_remaining": f"gt.{cutoff_iso}",
+                "select": "auction_id,storefront",
+                "limit": "500",
+            },
+            headers={"apikey": svc_key, "Authorization": f"Bearer {svc_key}"},
+            timeout=20,
+        )
+        r.raise_for_status()
+        rows = r.json()
+    except Exception as exc:
+        log.error("DB fallback: Supabase query failed: %s", exc)
+        return []
+
+    if not rows:
+        log.warning("DB fallback: no active auction IDs found in Supabase")
+        return []
+
+    log.info("DB fallback: refreshing %d known auction IDs via detail endpoint", len(rows))
+
+    # Import here to avoid circular import (fetch_listing imports from scraper.bstock)
+    from scraper.fetch_listing import fetch_listing
+
+    results: list[Listing] = []
+    for row in rows:
+        aid = row["auction_id"]
+        try:
+            detail = fetch_listing(aid)
+            if not detail:
+                log.debug("DB fallback: no data for %s", aid)
+                continue
+            # Convert detail dict back to a Listing object
+            listing = Listing(
+                auction_id=aid,
+                url=detail.get("url") or f"https://bstock.com/buy/listings/details/{aid}",
+                title=detail.get("title"),
+                image_url=detail.get("image_url"),
+                manifest_doc_url=detail.get("manifest_doc_url"),
+                location=detail.get("location"),
+                listing_type=detail.get("listing_type"),
+                condition=detail.get("condition"),
+                unit_count=detail.get("unit_count"),
+                msrp=detail.get("msrp"),
+                current_bid=detail.get("current_bid"),
+                pct_of_msrp=detail.get("pct_of_msrp"),
+                per_unit=detail.get("per_unit"),
+                time_remaining=detail.get("time_remaining"),
+                bid_count=detail.get("bid_count"),
+                price_label=detail.get("price_label"),
+                storefront=detail.get("storefront") or row.get("storefront"),
+            )
+            results.append(listing)
+        except Exception as exc:
+            log.warning("DB fallback: failed to refresh %s: %s", aid, exc)
+
+    log.info("DB fallback: refreshed %d listings", len(results))
+    return results
+
+
+def scrape_listings(conditions: list[str] | None = None) -> list[Listing]:
+    """Scrape all active B-Stock listings for the given condition(s).
+
+    conditions: list of B-Stock condition strings, e.g. ["New"], ["New", "Used"].
+    Defaults to SCRAPE_CONDITIONS env var, or ["New"] if not set.
+
+    B-Stock condition values: "New", "Used", "Salvage"
+
+    If the primary RSC endpoint is blocked by Cloudflare (403), falls back to
+    refreshing known auction IDs from Supabase via /buy/listings/details/{id}.
+    """
+    if conditions is None:
+        raw = os.getenv("SCRAPE_CONDITIONS", "New")
+        conditions = [c.strip() for c in raw.split(",") if c.strip()]
+
+    token = get_jwt_token()
+    log.info("Scraping conditions: %s", conditions)
+
+    results = _scrape_via_rsc(token, conditions)
+
+    if not results:
+        log.warning("RSC scrape returned 0 listings — activating DB fallback (CF bypass)")
+        results = _scrape_via_db_fallback(token)
 
     log.info("Scraped %d total listings", len(results))
     return results
