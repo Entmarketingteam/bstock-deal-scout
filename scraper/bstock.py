@@ -108,18 +108,22 @@ def get_jwt_token() -> str:
 def _fetch_rsc_page(token: str, offset: int = 0, condition_qs: str = "condition=%5B%22New%22%5D") -> str:
     """Fetch one RSC page and return decompressed body text."""
     url = LISTINGS_RSC_BASE.format(condition_qs=condition_qs, offset=offset)
-    resp = httpx.get(
-        url,
-        headers={
-            "User-Agent": BROWSER_UA,
-            "Cookie": f"token={token}; access_token={token}",
-            "Authorization": f"Bearer {token}",
-            "RSC": "1",
-            "Accept-Encoding": "gzip",
-        },
-        timeout=30,
-        follow_redirects=True,
-    )
+    proxy_url = os.getenv("HTTP_PROXY") or os.getenv("HTTPS_PROXY")
+    client_kwargs: dict = {"timeout": 30, "follow_redirects": True}
+    if proxy_url:
+        client_kwargs["proxies"] = proxy_url
+        log.debug("RSC fetch via proxy %s...", proxy_url[:30])
+    with httpx.Client(**client_kwargs) as client:
+        resp = client.get(
+            url,
+            headers={
+                "User-Agent": BROWSER_UA,
+                "Cookie": f"token={token}; access_token={token}",
+                "Authorization": f"Bearer {token}",
+                "RSC": "1",
+                "Accept-Encoding": "gzip",
+            },
+        )
     if resp.status_code != 200:
         raise RuntimeError(
             f"RSC fetch failed: {resp.status_code} url={url}"
