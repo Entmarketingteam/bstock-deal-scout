@@ -47,6 +47,19 @@ _cached_token: str = ""
 _token_fetched_at: float = 0.0
 TOKEN_TTL_SECONDS = 3500  # FusionAuth JWTs are typically 1hr; refresh at ~58min
 
+# ── Webshare sticky residential proxy ────────────────────────────────────────
+_WEBSHARE_USER = os.getenv("WEBSHARE_PROXY_USER", "")
+_WEBSHARE_PASS = os.getenv("WEBSHARE_PROXY_PASS", "")
+_WEBSHARE_SESSION = "bstock1"  # fixed session = same residential IP per scrape run
+
+
+def _webshare_proxy_url() -> str | None:
+    """Return Webshare sticky residential proxy URL, or None if not configured."""
+    if not _WEBSHARE_USER or not _WEBSHARE_PASS:
+        return None
+    return f"http://{_WEBSHARE_USER}-session-{_WEBSHARE_SESSION}:{_WEBSHARE_PASS}@p.webshare.io:80"
+
+
 
 @dataclass
 class Listing:
@@ -105,25 +118,23 @@ def get_jwt_token() -> str:
     return _cached_token
 
 
-def _fetch_rsc_page(token: str, offset: int = 0, condition_qs: str = "condition=%5B%22New%22%5D") -> str:
-    """Fetch one RSC page and return decompressed body text."""
+def _fetch_rsc_page(token: str, offset: int = 0, condition_qs: str = "condition=%5B%22New%22%5D", proxy: str | None = None) -> str:
+    """Fetch one RSC page and return decompressed body text. proxy: optional HTTP proxy URL."""
     url = LISTINGS_RSC_BASE.format(condition_qs=condition_qs, offset=offset)
-    proxy_url = os.getenv("HTTP_PROXY") or os.getenv("HTTPS_PROXY")
-    client_kwargs: dict = {"timeout": 30, "follow_redirects": True}
-    if proxy_url:
-        client_kwargs["proxies"] = proxy_url
-        log.debug("RSC fetch via proxy %s...", proxy_url[:30])
-    with httpx.Client(**client_kwargs) as client:
-        resp = client.get(
-            url,
-            headers={
-                "User-Agent": BROWSER_UA,
-                "Cookie": f"token={token}; access_token={token}",
-                "Authorization": f"Bearer {token}",
-                "RSC": "1",
-                "Accept-Encoding": "gzip",
-            },
-        )
+    _get_kwargs: dict = {
+        "headers": {
+            "User-Agent": BROWSER_UA,
+            "Cookie": f"token={token}; access_token={token}",
+            "Authorization": f"Bearer {token}",
+            "RSC": "1",
+            "Accept-Encoding": "gzip",
+        },
+        "timeout": 30,
+        "follow_redirects": True,
+    }
+    if proxy:
+        _get_kwargs["proxy"] = proxy
+    resp = httpx.get(url, **_get_kwargs)
     if resp.status_code != 200:
         raise RuntimeError(
             f"RSC fetch failed: {resp.status_code} url={url}"
@@ -263,7 +274,7 @@ def _listing_from_rsc_obj(obj: dict) -> Listing | None:
     )
 
 
-def _scrape_via_rsc(token: str, conditions: list[str]) -> list[Listing]:
+def _scrape_via_rsc(token: str, conditions: list[str], proxy: str | None = None) -> list[Listing]:
     """Primary scrape path: /all-auctions RSC endpoint. Returns empty list on CF 403."""
     import urllib.parse as _ulp
     import json as _json
@@ -276,7 +287,7 @@ def _scrape_via_rsc(token: str, conditions: list[str]) -> list[Listing]:
     while True:
         log.info("Fetching RSC page offset=%d", offset)
         try:
-            body = _fetch_rsc_page(token, offset=offset, condition_qs=condition_qs)
+            body = _fetch_rsc_page(token, offset=offset, condition_qs=condition_qs, proxy=proxy)
         except RuntimeError as exc:
             if "403" in str(exc):
                 log.warning("RSC endpoint returned 403 (Cloudflare block) — will use DB fallback")
@@ -411,7 +422,18 @@ def scrape_listings(conditions: list[str] | None = None) -> list[Listing]:
     results = _scrape_via_rsc(token, conditions)
 
     if not results:
-        log.warning("RSC scrape returned 0 listings — activating DB fallback (CF bypass)")
+        proxy_url = _webshare_proxy_url()
+        if proxy_url:
+            log.info("Direct RSC returned 0 — retrying via Webshare residential proxy")
+            results = _scrape_via_rsc(token, conditions, proxy=proxy_url)
+            if results:
+                log.info("Proxy RSC succeeded: %d new listings discovered", len(results))
+            else:
+                log.warning("Proxy RSC also returned 0 — activating DB fallback")
+        else:
+            log.warning("RSC scrape returned 0 listings — activating DB fallback (CF bypass)")
+
+    if not results:
         results = _scrape_via_db_fallback(token)
 
     log.info("Scraped %d total listings", len(results))
