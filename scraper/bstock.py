@@ -60,6 +60,25 @@ def _webshare_proxy_url() -> str | None:
     return f"http://{_WEBSHARE_USER}-session-{_WEBSHARE_SESSION}:{_WEBSHARE_PASS}@p.webshare.io:80"
 
 
+# ── Browserbase (Cloudflare Turnstile bypass for /all-auctions discovery) ─────
+# /all-auctions is now behind a route-level Cloudflare Turnstile interstitial
+# ("just a moment") that residential-proxy httpx retries cannot clear. We drive
+# a Browserbase managed headless browser to clear the challenge, then run the
+# RSC fetch *inside* the browser context (same origin, cf_clearance cookie + JA3
+# ride along) and feed the body to the existing _extract_listings_from_rsc parser.
+_BROWSERBASE_API_KEY = os.getenv("BROWSERBASE_API_KEY", "")
+_BROWSERBASE_PROJECT_ID = os.getenv("BROWSERBASE_PROJECT_ID", "")
+# Single attempt with these capability modes. advanced_stealth/verified gate on
+# the Browserbase Scale plan. Tune without a code change via the env var, e.g.
+# set BROWSERBASE_MODES="proxies,advanced_stealth,verified" if the interstitial
+# still doesn't clear, or "proxies" alone on a non-Scale tier.
+_BROWSERBASE_MODES = os.getenv("BROWSERBASE_MODES", "proxies,advanced_stealth")
+
+
+def _browserbase_available() -> bool:
+    return bool(_BROWSERBASE_API_KEY and _BROWSERBASE_PROJECT_ID)
+
+
 
 @dataclass
 class Listing:
@@ -317,6 +336,147 @@ def _scrape_via_rsc(token: str, conditions: list[str], proxy: str | None = None)
     return results
 
 
+def _build_rsc_url(conditions: list[str], offset: int) -> str:
+    """Build the /all-auctions RSC URL for a given condition set + offset."""
+    import urllib.parse as _ulp
+    import json as _json
+    condition_qs = "condition=" + _ulp.quote(_json.dumps(conditions))
+    return LISTINGS_RSC_BASE.format(condition_qs=condition_qs, offset=offset)
+
+
+def _create_browserbase_session(bb, modes: list[str]):
+    """Create a Browserbase session with the requested capability modes.
+
+    modes may contain: "proxies", "advanced_stealth", "verified".
+    Raises browserbase.APIStatusError (e.g. 402/plan-tier) which the caller
+    surfaces verbatim rather than masking.
+    """
+    # snake_case keys = the SDK's documented input; it transforms them to the
+    # camelCase wire aliases. Passing camelCase directly is not the SDK contract.
+    browser_settings: dict = {"solve_captchas": True}
+    use_proxies = "proxies" in modes
+    if "advanced_stealth" in modes:
+        browser_settings["advanced_stealth"] = True
+    if "verified" in modes:
+        browser_settings["verified"] = True
+    return bb.sessions.create(
+        project_id=_BROWSERBASE_PROJECT_ID,
+        proxies=use_proxies,
+        browser_settings=browser_settings,
+    )
+
+
+def _scrape_via_browserbase(token: str, conditions: list[str]) -> list[Listing]:
+    """Discovery via Browserbase managed browser that clears Cloudflare Turnstile.
+
+    Flow (single session, Turnstile solved once):
+      1. Create session (proxies + advanced stealth), connect over CDP.
+      2. Inject JWT cookies (token / access_token) for .bstock.com.
+      3. Navigate to /all-auctions, wait for the interstitial to clear.
+      4. Run the RSC fetch *in-page* per offset (cf_clearance + correct JA3 ride
+         along), feed each body to _extract_listings_from_rsc — full parser reuse.
+
+    RSC-only: if the in-page RSC fetch ever returns unparseable bodies, a DOM-card
+    parser would need to be added; not implemented (RSC has the rich fields).
+    """
+    if not _browserbase_available():
+        log.warning("Browserbase not configured (BROWSERBASE_API_KEY/PROJECT_ID) — skipping")
+        return []
+
+    try:
+        from browserbase import Browserbase
+        from playwright.sync_api import sync_playwright
+    except ImportError as exc:
+        log.error("Browserbase/Playwright not installed: %s", exc)
+        return []
+
+    modes = [m.strip() for m in _BROWSERBASE_MODES.split(",") if m.strip()]
+    bb = Browserbase(api_key=_BROWSERBASE_API_KEY)
+
+    try:
+        session = _create_browserbase_session(bb, modes)
+    except Exception as exc:
+        # Plan-tier / quota errors (402 Payment Required, advanced_stealth gating)
+        # are real blockers — surface verbatim, do not silently fall through.
+        log.error("Browserbase session create failed (modes=%s): %s", modes, exc)
+        return []
+
+    log.info("Browserbase session created: %s (modes=%s)", session.id, modes)
+    results: list[Listing] = []
+    seen_ids: set[str] = set()
+
+    with sync_playwright() as p:
+        browser = p.chromium.connect_over_cdp(session.connect_url)
+        try:
+            # Use the session's pre-bound context (stealth/proxy attach to it).
+            ctx = browser.contexts[0]
+            ctx.add_cookies([
+                {"name": "token", "value": token, "domain": ".bstock.com", "path": "/"},
+                {"name": "access_token", "value": token, "domain": ".bstock.com", "path": "/"},
+            ])
+            page = ctx.pages[0] if ctx.pages else ctx.new_page()
+
+            # Surface Browserbase captcha-solving lifecycle in logs.
+            page.on("console", lambda msg: (
+                log.info("Browserbase: Turnstile solving started") if msg.text == "browserbase-solving-started"
+                else log.info("Browserbase: Turnstile solving finished") if msg.text == "browserbase-solving-finished"
+                else None
+            ))
+
+            # Navigate to the listings page to clear the interstitial once.
+            nav_url = _build_rsc_url(conditions, 0).replace("&_rsc=rsc1", "")
+            log.info("Browserbase: navigating to %s", nav_url)
+            page.goto(nav_url, wait_until="domcontentloaded", timeout=60000)
+
+            # Wait for the challenge to clear: the interstitial title is
+            # "Just a moment..."; the real page is not. Poll up to ~30s.
+            for _ in range(30):
+                title = (page.title() or "").lower()
+                if "just a moment" not in title and "attention required" not in title:
+                    break
+                page.wait_for_timeout(1000)
+            else:
+                log.warning("Browserbase: interstitial did not clear in time (title=%r)", page.title())
+
+            # Loop offsets via in-page RSC fetch (same origin → cf_clearance rides).
+            offset = 0
+            while True:
+                rsc_url = _build_rsc_url(conditions, offset)
+                body = page.evaluate(
+                    """async ({url, tok}) => {
+                        const r = await fetch(url, {
+                            headers: {'RSC': '1', 'Authorization': 'Bearer ' + tok},
+                            credentials: 'include',
+                        });
+                        return {status: r.status, text: await r.text()};
+                    }""",
+                    {"url": rsc_url, "tok": token},
+                )
+                status = body.get("status")
+                text = body.get("text") or ""
+                if status != 200:
+                    log.warning("Browserbase in-page RSC offset=%d returned status=%s", offset, status)
+                    break
+
+                page_listings, total = _extract_listings_from_rsc(text)
+                log.info("Browserbase RSC offset=%d: %d listings (total=%d)", offset, len(page_listings), total)
+                if not page_listings:
+                    break
+                for obj in page_listings:
+                    listing = _listing_from_rsc_obj(obj)
+                    if listing and listing.auction_id not in seen_ids:
+                        seen_ids.add(listing.auction_id)
+                        results.append(listing)
+                offset += len(page_listings)
+                if offset >= total:
+                    break
+        finally:
+            browser.close()
+
+    log.info("Browserbase discovery: %d listings", len(results))
+    return results
+
+
 def _scrape_via_db_fallback(token: str) -> list[Listing]:
     """CF-bypass fallback: reload known auction IDs from Supabase, refresh each via
     /buy/listings/details/{id} which is NOT Cloudflare-protected.
@@ -419,21 +579,24 @@ def scrape_listings(conditions: list[str] | None = None) -> list[Listing]:
     token = get_jwt_token()
     log.info("Scraping conditions: %s", conditions)
 
+    # 1. Fast-path: direct RSC fetch (cheap, no browser cost). Succeeds only if
+    #    the request IP isn't hitting the route-level Cloudflare Turnstile.
     results = _scrape_via_rsc(token, conditions)
 
+    # 2. Primary discovery: Browserbase managed browser clears Turnstile.
+    #    The /all-auctions route now serves an interactive Turnstile interstitial
+    #    that proxy-rotated httpx cannot bypass — only a real browser solving the
+    #    challenge can. This is the main discovery path when the fast-path 403s.
     if not results:
-        proxy_url = _webshare_proxy_url()
-        if proxy_url:
-            log.info("Direct RSC returned 0 — retrying via Webshare residential proxy")
-            results = _scrape_via_rsc(token, conditions, proxy=proxy_url)
-            if results:
-                log.info("Proxy RSC succeeded: %d new listings discovered", len(results))
-            else:
-                log.warning("Proxy RSC also returned 0 — activating DB fallback")
-        else:
-            log.warning("RSC scrape returned 0 listings — activating DB fallback (CF bypass)")
+        log.info("Direct RSC returned 0 — attempting Browserbase Turnstile bypass")
+        results = _scrape_via_browserbase(token, conditions)
+        if results:
+            log.info("Browserbase discovery succeeded: %d listings", len(results))
 
+    # 3. Last resort: refresh known auction IDs from Supabase via the detail
+    #    endpoint (not Turnstile-protected). Cannot discover NEW listings.
     if not results:
+        log.warning("Discovery returned 0 — activating DB fallback (refresh-only)")
         results = _scrape_via_db_fallback(token)
 
     log.info("Scraped %d total listings", len(results))
