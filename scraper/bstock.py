@@ -68,11 +68,13 @@ def _webshare_proxy_url() -> str | None:
 # ride along) and feed the body to the existing _extract_listings_from_rsc parser.
 _BROWSERBASE_API_KEY = os.getenv("BROWSERBASE_API_KEY", "")
 _BROWSERBASE_PROJECT_ID = os.getenv("BROWSERBASE_PROJECT_ID", "")
-# Single attempt with these capability modes. advanced_stealth/verified gate on
-# the Browserbase Scale plan. Tune without a code change via the env var, e.g.
-# set BROWSERBASE_MODES="proxies,advanced_stealth,verified" if the interstitial
-# still doesn't clear, or "proxies" alone on a non-Scale tier.
-_BROWSERBASE_MODES = os.getenv("BROWSERBASE_MODES", "proxies,advanced_stealth")
+# Single attempt with these capability modes. advanced_stealth is Enterprise-only
+# (session create 403s with "Advanced stealth mode is only available on the
+# Enterprise plan"), so it is NOT in the default. On the Hobby plan, "proxies"
+# + auto captcha-solving clears the Turnstile interstitial (verified live: 201
+# session, Turnstile solved, listings returned). Tune via the env var, e.g. set
+# BROWSERBASE_MODES="proxies,advanced_stealth,verified" only on Enterprise.
+_BROWSERBASE_MODES = os.getenv("BROWSERBASE_MODES", "proxies")
 
 
 def _browserbase_available() -> bool:
