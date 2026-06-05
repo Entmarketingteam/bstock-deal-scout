@@ -433,12 +433,20 @@ def _scrape_via_browserbase(token: str, conditions: list[str]) -> list[Listing]:
             # Wait for the challenge to clear: the interstitial title is
             # "Just a moment..."; the real page is not. Poll up to ~30s.
             for _ in range(30):
-                title = (page.title() or "").lower()
+                try:
+                    title = (page.title() or "").lower()
+                except Exception:
+                    page.wait_for_timeout(1000)
+                    continue
                 if "just a moment" not in title and "attention required" not in title:
                     break
                 page.wait_for_timeout(1000)
             else:
-                log.warning("Browserbase: interstitial did not clear in time (title=%r)", page.title())
+                try:
+                    current_title = page.title()
+                except Exception:
+                    current_title = "Unknown (navigating)"
+                log.warning("Browserbase: interstitial did not clear in time (title=%r)", current_title)
 
             # Loop offsets via in-page RSC fetch (same origin → cf_clearance rides).
             offset = 0

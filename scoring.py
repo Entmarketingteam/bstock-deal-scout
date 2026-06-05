@@ -19,7 +19,16 @@ HIGH_PRIORITY_PCT = 5.0
 HIGH_PRIORITY_MSRP = 10_000
 
 # Exact B-Stock storefront names to track — only these get scraped + shown
-TARGET_STOREFRONTS = ["Kohler", "Ferguson", "Winston Water Cooler"]
+import os
+
+env_storefronts = os.getenv("TARGET_STOREFRONTS")
+if env_storefronts:
+    TARGET_STOREFRONTS = [s.strip() for s in env_storefronts.split(",") if s.strip()]
+else:
+    TARGET_STOREFRONTS = [
+        "Kohler", "Ferguson", "Winston Water Cooler",
+        "Royal Closeouts", "QVC", "Target", "Get Live", "LoopRL"
+    ]
 TARGET_STOREFRONTS_LOWER = {s.lower() for s in TARGET_STOREFRONTS}
 
 # Brands/storefronts to watch closely — alert on "Good Price" too, lower MSRP floor
