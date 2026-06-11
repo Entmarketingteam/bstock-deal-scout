@@ -70,10 +70,15 @@ _BROWSERBASE_API_KEY = os.getenv("BROWSERBASE_API_KEY", "")
 _BROWSERBASE_PROJECT_ID = os.getenv("BROWSERBASE_PROJECT_ID", "")
 # Single attempt with these capability modes. advanced_stealth is Enterprise-only
 # (session create 403s with "Advanced stealth mode is only available on the
-# Enterprise plan"), so it is NOT in the default. On the Hobby plan, "proxies"
-# + auto captcha-solving clears the Turnstile interstitial (verified live: 201
-# session, Turnstile solved, listings returned). Tune via the env var, e.g. set
-# BROWSERBASE_MODES="proxies,advanced_stealth,verified" only on Enterprise.
+# Enterprise plan"), so it is NOT in the default.
+# NOTE (verified 2026-06-05 + 2026-06-09): on the current (Hobby) plan, "proxies"
+# + auto captcha-solving does NOT clear the /all-auctions Turnstile interstitial
+# — the solver fires but the "Just a moment..." page never clears and the RSC
+# fetch 403s, so discovery returns 0. No Browserbase mode available on this tier
+# clears Turnstile. Discovery is effectively blocked until an Enterprise upgrade
+# (for advanced_stealth/verified) or a non-browser discovery surface is found.
+# Tune via the env var, e.g. BROWSERBASE_MODES="proxies,advanced_stealth,verified"
+# only on Enterprise.
 _BROWSERBASE_MODES = os.getenv("BROWSERBASE_MODES", "proxies")
 
 
